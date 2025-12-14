@@ -12,6 +12,7 @@ from tqdm import tqdm
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from lib import resnet50, resnet50_w, embed_layer, PSR, refine_cams_with_bkg, SR_generation
+from datetime import datetime
 
 
 def load_pretrained(teacher, student, scratch):
@@ -171,12 +172,16 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
 if __name__ == '__main__':
     for i in range(5):
         is_test = False
+        
+        # 获取当前时间戳
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         parser = argparse.ArgumentParser()
-        parser.add_argument('--train_save', type = str, default = './log/ADD/' + str(i))
+        parser.add_argument('--train_save', type = str, default = f'./log/ADD/{timestamp}/{i}')
         parser.add_argument('--fold', type = int, default = i)
-        parser.add_argument('--batch_size', type = int, default = 16)   
+        parser.add_argument('--batch_size', type = int, default = 1)   
         parser.add_argument('--epochs', type = int, default = 200)      
-        parser.add_argument('--device', default = 'cuda:3', help = 'device id (i.e. 0 or 0,1 or cpu)')
+        parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
         parser.add_argument("--low_thre", default = 0.3, type = float, help = "low_bkg_score")
         parser.add_argument("--bkg_thre", default = 0.5, type = float, help = "bkg_score")
@@ -199,7 +204,7 @@ if __name__ == '__main__':
         ce_loss = nn.CrossEntropyLoss()
         sim_loss = torch.nn.CosineEmbeddingLoss()
         
-        student = resnet50_w(pretrained=False, num_classes=2).to(opt.device)
+        student = resnet50_w(pretrained=True, num_classes=2).to(opt.device)
         teacher = resnet50(pretrained=False, num_classes=2).to(opt.device)
         embed_layer_=embed_layer().to(opt.device)
         teacher, student = load_pretrained(teacher, student, scratch=False)

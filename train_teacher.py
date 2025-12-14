@@ -9,6 +9,7 @@ from dataloader import CPCDataset
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from lib import resnet50
+from datetime import datetime
 
 
 def get_ce_loss(img, label, network):
@@ -73,22 +74,29 @@ def train(teacher,  epochs=400, is_test=True):
             else:
                 val_acc=val_acc_num / sample_num
                 logging.info('epoch: {},  test_acc: {}'.format(epoch, val_acc))
-                if val_acc > val_acc_best and val_acc<=train_acc:
+                if val_acc > val_acc_best:
                     val_acc_best = val_acc
-                    print('##############################################################################best', val_acc_best)
-                    logging.info('##############################################################################best:{}'.format(val_acc_best))
+                print('best is', val_acc_best)
+                logging.info('best is {}'.format(val_acc_best))
                 print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best))
+                print('##############################################################################')
+                logging.info('#############################################################################')
+                
 
 
 if __name__ == '__main__':
     for i in range(5):
         is_test = False
+        
+        # 获取当前时间戳
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         parser = argparse.ArgumentParser()
-        parser.add_argument('--train_save', type=str, default='./log/teacher/'+str(i))
+        parser.add_argument('--train_save', type=str, default=f'./log/teacher/{timestamp}/{i}')
         parser.add_argument('--fold', type=int, default=i)
         parser.add_argument('--batch_size', type=int, default=16)      
-        parser.add_argument('--epochs', type=int, default=200)               
-        parser.add_argument('--device', default='cuda:3', help='device id (i.e. 0 or 0,1 or cpu)')
+        parser.add_argument('--epochs', type=int, default=5)               
+        parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
         
         dataset = CPCDataset(is_train=True, split_id=opt.fold)

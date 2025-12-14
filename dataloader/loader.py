@@ -5,16 +5,21 @@ import imageio
 from scipy.ndimage import rotate
 from skimage.transform import resize
 from torch.utils.data import Dataset
-
+import os
 
 class CPCDataset(Dataset):
-    def __init__(self, is_train,split_id, enable_aug=True):
+    def __init__(self, is_train, split_id, enable_aug=True):
         self.enable_aug = enable_aug
-        if is_train==True:
-            self.wli_list = open('../split/train_wht_pub%d.txt' % split_id).readlines() 
+        # 获取当前脚本所在目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        split_dir = os.path.join(current_dir, '..', 'split')
+        
+        if is_train == True:
+            split_file = os.path.join(split_dir, f'train_wht_pub{split_id}.txt')
         else:
-            self.wli_list = open('../split/val_wht_pub0%d.txt' % split_id).readlines()
-
+            split_file = os.path.join(split_dir, f'val_wht_pub{split_id}.txt')
+            
+        self.wli_list = open(split_file).readlines()
         self.is_train = is_train
         self.wli_list = list(map(lambda x: x.strip(), self.wli_list))
         self.wli_label = list(map(lambda x: 'hyperplastic_lesions' not in x, self.wli_list))
