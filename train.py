@@ -91,6 +91,7 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
         phases = ('train', 'test')
 
     val_acc_best = 0
+    best_model_epoch = 0
     space_loss = torch.zeros(1).to(opt.device)
     loss_ADD_1=torch.zeros(1).to(opt.device)
     loss_ADD_2=torch.zeros(1).to(opt.device)
@@ -108,7 +109,7 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                 val_acc_num = 0
             summary = []
             sample_num = 0
-            for batch in tqdm(ldr):
+            for batch in tqdm(ldr, leave=False):
                 wli_img, nbi_img, label= \
                     batch[0].to(opt.device).float(), batch[1].to(opt.device).float(), batch[2].to(opt.device).long()
                 pred_nbi,f4_tea = teacher(nbi_img)
@@ -157,29 +158,38 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                 tb_writer.add_scalar(tags[2], summary[1], epoch)
                 tb_writer.add_scalar(tags[3], summary[2], epoch)
                 tb_writer.add_scalar(tags[4], summary[3], epoch)
-                print('Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, loss_ADD_1: %0.2f,loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3]))#
-                save_model(epoch)
+                print('##############################################################################')
+                print('[TRAIN] Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, loss_ADD_1: %0.2f,loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3]))#
+                #save_model(epoch)
             else:
                 val_acc=val_acc_num / sample_num
-                logging.info('epoch: {},  test_acc: {}'.format(epoch, val_acc))
-                if val_acc > val_acc_best and val_acc < train_acc:
-                    val_acc_best = val_acc
-                    print('##############################################################################best', val_acc_best)
-                    logging.info('##############################################################################best:{}'.format(val_acc_best))
-                print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best))
+                # logging.info('epoch: {},  test_acc: {}'.format(epoch, val_acc))
+                if val_acc > val_acc_best:
+                    if val_acc < train_acc:
+                        val_acc_best = val_acc
+                        best_model_epoch = epoch
+                        save_model(epoch)
+                    else:   
+                        print('In epoch {} val_acc exceeds train_acc, not updating best model'.format(epoch))
+                        logging.info('In epoch {} val_acc exceeds train_acc, not updating best model'.format(epoch))
+                print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best), 'best_epoch: %d' % best_model_epoch)
+                logging.info('[EVAL] Epoch %d, ' % epoch + 'val_acc: %0.2f, best_acc: %0.3f, ' % (val_acc, val_acc_best) + 'best_epoch: %d' % best_model_epoch)
+                # print('best is ', val_acc_best)
+                # logging.info('##############################################################################best:{}'.format(val_acc_best))
+                # print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best))
         
 
 if __name__ == '__main__':
-    for i in range(5):
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    for i in range(1):
         is_test = False
-        
-        # 获取当前时间戳
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type = str, default = f'./log/ADD/{timestamp}/{i}')
         parser.add_argument('--fold', type = int, default = i)
-        parser.add_argument('--batch_size', type = int, default = 1)   
+        parser.add_argument('--batch_size', type = int, default = 16)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
