@@ -1,1 +1,1 @@
-from .loader import CPCDataset
+from .loader import CPCDataset, MultiClassPairDataset
