@@ -6,6 +6,7 @@ from scipy.ndimage import rotate
 from skimage.transform import resize
 from torch.utils.data import Dataset
 import os
+import csv
 
 class CPCDataset(Dataset):
     def __init__(self, is_train, split_id, enable_aug=True):
@@ -106,18 +107,17 @@ class MultiClassPairDataset(Dataset):
                 if not os.path.isdir(wli_dir) or not os.path.isdir(nbi_dir):
                     continue
 
-                wli_files = self._collect_images(wli_dir)
-                nbi_files = self._collect_images(nbi_dir)
-                if len(wli_files) == 0 or len(nbi_files) == 0:
+                csv_path = self._find_csv(patient_dir)
+                if csv_path is None:
                     continue
 
-                nbi_by_stem = {os.path.splitext(os.path.basename(p))[0]: p for p in nbi_files}
-                for wli_path in wli_files:
-                    stem = os.path.splitext(os.path.basename(wli_path))[0]
-                    nbi_path = nbi_by_stem.get(stem)
-                    if nbi_path is None:
-                        nbi_path = random.choice(nbi_files)
-                    self.samples.append((wli_path, nbi_path, label))
+                pairs = self._read_pairs_from_csv(csv_path, wli_dir, nbi_dir)
+                if len(pairs) == 0:
+                    continue
+
+                for wli_path, nbi_path in pairs:
+                    # 记录 patient_name 与 split（集合性质）
+                    self.samples.append((wli_path, nbi_path, label, patient_name, self.split))
                     label_stats[label] = label_stats.get(label, 0) + 1
 
         print('multiclass:', label_stats)
@@ -130,6 +130,77 @@ class MultiClassPairDataset(Dataset):
         files.sort()
         return files
 
+    def _find_csv(self, patient_dir):
+        csv_files = []
+        for name in os.listdir(patient_dir):
+            if name.lower().endswith('.csv'):
+                csv_files.append(os.path.join(patient_dir, name))
+        if len(csv_files) == 0:
+            return None
+        csv_files.sort()
+        return csv_files[0]
+
+    def _resolve_pair_path(self, base_dir, alt_dir, raw_path):
+        if raw_path is None:
+            return None
+        raw_path = raw_path.strip()
+        if raw_path == '':
+            return None
+        if os.path.isabs(raw_path) and os.path.isfile(raw_path):
+            return raw_path
+
+        direct = os.path.join(base_dir, raw_path)
+        if os.path.isfile(direct):
+            return direct
+
+        alt = os.path.join(alt_dir, raw_path)
+        if os.path.isfile(alt):
+            return alt
+
+        return None
+
+    def _read_pairs_from_csv(self, csv_path, wli_dir, nbi_dir):
+        pairs = []
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        if len(rows) == 0:
+            return pairs
+
+        header = [h.strip().lower() for h in rows[0]]
+        has_header = any('wli' in h or 'nbi' in h for h in header)
+
+        if has_header:
+            wli_idx = None
+            nbi_idx = None
+            for i, name in enumerate(header):
+                if wli_idx is None and 'wli' in name:
+                    wli_idx = i
+                if nbi_idx is None and 'nbi' in name:
+                    nbi_idx = i
+            data_rows = rows[1:]
+        else:
+            wli_idx = 0
+            nbi_idx = 1 if len(rows[0]) > 1 else None
+            data_rows = rows
+
+        if wli_idx is None or nbi_idx is None:
+            return pairs
+
+        for row in data_rows:
+            if len(row) <= max(wli_idx, nbi_idx):
+                continue
+            wli_raw = row[wli_idx]
+            nbi_raw = row[nbi_idx]
+            wli_path = self._resolve_pair_path(wli_dir, nbi_dir, wli_raw)
+            nbi_path = self._resolve_pair_path(nbi_dir, wli_dir, nbi_raw)
+            if wli_path is None or nbi_path is None:
+                continue
+            pairs.append((wli_path, nbi_path))
+
+        return pairs
+
     def _ensure_3ch(self, img):
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
@@ -138,7 +209,7 @@ class MultiClassPairDataset(Dataset):
         return img
 
     def __getitem__(self, index):
-        wli_path, nbi_path, label = self.samples[index]
+        wli_path, nbi_path, label, patient_name, set_property = self.samples[index]
         wli_img = imageio.imread(wli_path)
         nbi_img = imageio.imread(nbi_path)
         wli_img = self._ensure_3ch(wli_img)
@@ -167,7 +238,7 @@ class MultiClassPairDataset(Dataset):
 
         wli_img = np.swapaxes(wli_img, 0, -1)
         nbi_img = np.swapaxes(nbi_img, 0, -1)
-        return wli_img, nbi_img, label, wli_path, nbi_path
+        return wli_img, nbi_img, label, wli_path, nbi_path, patient_name, set_property
 
     def __len__(self):
         return len(self.samples)

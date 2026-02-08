@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from dataloader import CPCDataset
+from dataloader.loader import MultiClassPairDataset
 from tqdm import tqdm
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -121,7 +121,7 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                     f_tea_att = embed_layer_(f4_tea.detach())
                     logit_loss = sim_loss(pred_nbi.detach(), pred_wli, torch.ones(1).to(opt.device))
 
-                    if epoch>15:
+                    if epoch>0:
                         cam1 = cam(f4_stu, pred_wli, label)
                         cam2 = cam(f4_tea, pred_nbi, label)
 
@@ -140,7 +140,7 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                     loss.backward()
                     optimizer_embed_layer.step()
                     optimizer_stu.step()
-                    summary.append((loss.item(), CE_loss.item(), loss_ADD_1.item(),loss_ADD_2.item()))
+                    summary.append((loss.item(), CE_loss.item(), logit_loss.item(), loss_ADD_1.item(),loss_ADD_2.item()))
                     # train_acc
                     train_acc_num = train_acc_num+acc_wli
                     sample_num += wli_img.shape[0]
@@ -152,14 +152,15 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
             
             if phase == 'train':
                 train_acc=train_acc_num / sample_num
-                tags = ['acc_wli','train_total_loss','CE_loss', 'loss_ADD_1','loss_ADD_2']
+                tags = ['acc_wli','train_total_loss','CE_loss', 'logit_loss', 'loss_ADD_1','loss_ADD_2']
                 tb_writer.add_scalar(tags[0], train_acc, epoch)
                 tb_writer.add_scalar(tags[1], summary[0], epoch)
                 tb_writer.add_scalar(tags[2], summary[1], epoch)
                 tb_writer.add_scalar(tags[3], summary[2], epoch)
                 tb_writer.add_scalar(tags[4], summary[3], epoch)
+                tb_writer.add_scalar(tags[5], summary[4], epoch)
                 print('##############################################################################')
-                print('[TRAIN] Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, loss_ADD_1: %0.2f,loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3]))#
+                print('[TRAIN] Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, logit_loss: %0.2f, loss_ADD_1: %0.2f, loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3], summary[4]))#
                 #save_model(epoch)
             else:
                 val_acc=val_acc_num / sample_num
@@ -189,7 +190,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type = str, default = f'./log/ADD/{timestamp}/{i}')
         parser.add_argument('--fold', type = int, default = i)
-        parser.add_argument('--batch_size', type = int, default = 16)   
+        parser.add_argument('--batch_size', type = int, default = 4)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
@@ -206,16 +207,16 @@ if __name__ == '__main__':
                     format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
                     level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p')
 
-        dataset = CPCDataset(is_train=True,split_id=opt.fold)
-        val_dataset = CPCDataset(is_train=False,split_id=opt.fold)
+        dataset = MultiClassPairDataset(root_dir='./my_dataset', split='train', enable_aug=True, target_size=448)
+        val_dataset = MultiClassPairDataset(root_dir='./my_dataset', split='val', enable_aug=False, target_size=448)
         loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=opt.batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=opt.batch_size, shuffle=False)
 
         ce_loss = nn.CrossEntropyLoss()
         sim_loss = torch.nn.CosineEmbeddingLoss()
         
-        student = resnet50_w(pretrained=True, num_classes=2).to(opt.device)
-        teacher = resnet50(pretrained=False, num_classes=2).to(opt.device)
+        student = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
+        teacher = resnet50(pretrained=False, num_classes=4).to(opt.device)
         embed_layer_=embed_layer().to(opt.device)
         teacher, student = load_pretrained(teacher, student, scratch=False)
         tb_writer = SummaryWriter(opt.train_save + '/run/')

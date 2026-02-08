@@ -5,7 +5,7 @@ import logging
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from dataloader import CPCDataset
+from dataloader.loader import MultiClassPairDataset
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from lib import resnet50
@@ -101,15 +101,15 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type=str, default=f'./log/teacher/{timestamp}/{i}')
         parser.add_argument('--fold', type=int, default=i)
-        parser.add_argument('--batch_size', type=int, default=16)      
+        parser.add_argument('--batch_size', type=int, default=4)      
         parser.add_argument('--epochs', type=int, default=200)               
         parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
         
-        dataset = CPCDataset(is_train=True, split_id=opt.fold)
-        val_dataset = CPCDataset(is_train=False, split_id=opt.fold)
-        loader = DataLoader(dataset, batch_size = opt.batch_size, num_workers = opt.batch_size, shuffle = True)
-        val_loader = DataLoader(val_dataset, batch_size = 1, num_workers = opt.batch_size, shuffle = False)
+        dataset = MultiClassPairDataset(root_dir='./my_dataset', split='train', enable_aug=True, target_size=448)
+        val_dataset = MultiClassPairDataset(root_dir='./my_dataset', split='val', enable_aug=False, target_size=448)
+        loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=opt.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=1, num_workers=opt.batch_size, shuffle=False)
 
         ce_loss = nn.CrossEntropyLoss()
 
@@ -124,6 +124,6 @@ if __name__ == '__main__':
             level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
         tb_writer = SummaryWriter(opt.train_save+'/run/')
 
-        teacher = resnet50(pretrained=True, num_classes=2).to(opt.device)
+        teacher = resnet50(pretrained=True, num_classes=4).to(opt.device)
         train(teacher, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader)
 

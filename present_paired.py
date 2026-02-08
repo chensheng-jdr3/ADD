@@ -48,58 +48,6 @@ def safe_imread(path):
 # 注意：`compute_hard_mask` 和 `compute_dark_region` 已提取到模块 `preproc_dark.py` 并在文件顶部导入，
 # 本处直接使用外部实现以保证代码一致性与可维护性。
 
-
-def compute_weight_gradient_energy(gray, hard_mask=None, dark_region=None, dark_soft_weight=0.2):
-    """
-    权重计算方式1：基于梯度能量 + 暗区软权重
-    高梯度区域（边缘/结构）权重大，暗区降权但不归零
-    
-    参数：
-        gray: 灰度图
-        hard_mask: 硬掩码（黑边+高光），0的位置权重为0
-        dark_region: 暗区区域，255的位置降权
-        dark_soft_weight: 暗区的软权重值（0~1）
-    
-    返回：float32 权重图，范围 [0, 1]
-    """
-    # 梯度能量
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    energy = cv2.magnitude(gx, gy)
-    
-    # 归一化到 [0, 1]
-    energy = cv2.normalize(energy, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
-    
-    # 加一个小的基础权重，避免低梯度区域完全被忽略
-    weight = 0.3 + 0.7 * energy
-    
-    # 暗区软权重
-    if dark_region is not None:
-        weight[dark_region > 0] *= dark_soft_weight
-    
-    # 硬掩码：黑边和高光区域权重为0
-    if hard_mask is not None:
-        weight[hard_mask == 0] = 0
-    
-    return weight
-
-
-def compute_weight_uniform(gray, hard_mask=None, dark_region=None, dark_soft_weight=0.2):
-    """
-    权重计算方式2：均匀权重 + 暗区软权重
-    所有有效像素权重相同，仅暗区降权
-    """
-    weight = np.ones_like(gray, dtype=np.float32)
-    
-    if dark_region is not None:
-        weight[dark_region > 0] = dark_soft_weight
-    
-    if hard_mask is not None:
-        weight[hard_mask == 0] = 0
-    
-    return weight
-
-
 def compute_weight_sift_distance(
     gray,
     hard_mask=None,
@@ -229,10 +177,6 @@ def compute_weight_sift_distance(
 
     return np.clip(weight, 0, 1).astype(np.float32)
 
-
-# 默认权重计算函数（可替换）
-# compute_weight = compute_weight_gradient_energy
-# compute_weight = compute_weight_uniform
 compute_weight = compute_weight_sift_distance
 
 
@@ -446,7 +390,7 @@ def draw_triplet(nbi, wli1, wli2, nw, ww1, ww2, s1, s2, path):
     if ok: buf.tofile(path)
 
 
-def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir):
+def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     """对单个患者做匹配"""
     # 预处理（返回：显示图, 梯度图, 权重图）
     load = lambda paths, key: [(path, *preprocess(
@@ -572,13 +516,26 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir):
                                    "top2_wli": os.path.basename(wli_data[j2][0]) if j2 >= 0 else "", "top2_score": s2,
                                    "is_ambiguous": is_amb})
     
+    # 额外输出：在原始患者目录下写入配对 CSV（如果提供了 patient_dir）
+    if patient_dir is not None and rows:
+        try:
+            out_csv = os.path.join(patient_dir, "paired_matches.csv")
+            with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["nbi_filename", "wli_filename", "score", "is_ambiguous"])
+                for r in rows:
+                    # r 格式: [patient_id, nbi_filename, wli_filename, final_score, is_ambiguous]
+                    w.writerow([r[1], r[2], r[3], r[4]])
+        except Exception:
+            pass
+
     return rows, debug
 
 
 def main():
     ap = argparse.ArgumentParser(description="NBI-WLI pairing")
-    ap.add_argument("--dataset_root", default="./标框")
-    ap.add_argument("--out_dir", default="./output")
+    ap.add_argument("--dataset_root", default="./my_dataset")
+    ap.add_argument("--out_dir", default="./output/pair_images_results")
     ap.add_argument("--global_assignment", type=int, default=1)
     for k, v in CFG.items():
         ap.add_argument(f"--{k}", type=type(v), default=v)
@@ -595,7 +552,7 @@ def main():
 
     # 固定任务与标签集合（根据用户确认）
     TASKS = ["train", "val", "test"]
-    LABELS = ["鳞状细胞癌", "低瘤", "高瘤"]
+    LABELS = ["鳞状细胞癌", "低瘤", "高瘤", "正常"]
 
     for task in TASKS:
         for label in LABELS:
@@ -620,7 +577,7 @@ def main():
                 if not (os.path.isdir(nbi_dir) and os.path.isdir(wli_dir)):
                     continue
 
-                rows, dbg = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), cfg, out_dir)
+                rows, dbg = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), cfg, out_dir, pdir)
                 all_rows.extend(rows)
                 if dbg.get("items"):
                     all_debug.append(dbg)

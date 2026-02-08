@@ -50,6 +50,7 @@ def SR_generation(cam_label1,cam_label2, ignore_index=255,confuse_value=0.5):
     _cam_label_rep2 = _cam_label2.repeat([1, _cam_label2.shape[-1], 1])
     _cam_label_rep2_t = _cam_label_rep2.permute(0,2,1)
     aff_label = (_cam_label_rep1 == _cam_label_rep2_t).type(torch.long)
+    aff_label = aff_label.float()
     
     for i in range(b):
         aff_label[i, :, _cam_label_rep1[i, 0, :]==ignore_index] = confuse_value
