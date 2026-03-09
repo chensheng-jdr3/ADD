@@ -15,6 +15,41 @@ from lib import resnet50, resnet50_w, embed_layer, PSR, refine_cams_with_bkg, SR
 from datetime import datetime
 
 
+def compute_confusion_matrix(labels, preds, num_classes):
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for y_true, y_pred in zip(labels, preds):
+        cm[int(y_true), int(y_pred)] += 1
+    return cm
+
+
+def compute_metrics_from_confusion_matrix(confusion_matrix):
+    row_sum = confusion_matrix.sum(axis=1)
+    diagonal = np.diag(confusion_matrix)
+    recall_per_class = np.divide(
+        diagonal,
+        row_sum,
+        out=np.zeros_like(diagonal, dtype=np.float64),
+        where=row_sum != 0,
+    )
+
+    col_sum = confusion_matrix.sum(axis=0)
+    precision_per_class = np.divide(
+        diagonal,
+        col_sum,
+        out=np.zeros_like(diagonal, dtype=np.float64),
+        where=col_sum != 0,
+    )
+
+    f1_per_class = np.divide(
+        2 * precision_per_class * recall_per_class,
+        precision_per_class + recall_per_class,
+        out=np.zeros_like(diagonal, dtype=np.float64),
+        where=(precision_per_class + recall_per_class) != 0,
+    )
+    macro_f1 = float(np.mean(f1_per_class))
+    return recall_per_class, f1_per_class, macro_f1
+
+
 def load_pretrained(teacher, student, scratch):
     stu_path ='./pretrained/' + str(opt.fold) + '_student.pth'
     tea_path = './pretrained/' + str(opt.fold) + '_teacher.pth'
@@ -79,7 +114,7 @@ def ADD(pseudo_label1, pseudo_label2, q, kv):
     return loss_align
 
 
-def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
+def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True):
     optimizer_stu = torch.optim.Adam(student.parameters(), lr=1e-4, weight_decay=1e-8)
     optimizer_embed_layer=torch.optim.Adam(embed_layer_.parameters(), lr=1e-4, weight_decay=1e-8)
     psr = PSR(num_iter=10, dilations=[1,2,4,8])
@@ -91,7 +126,9 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
         phases = ('train', 'test')
 
     val_acc_best = 0
+    val_macro_f1_best = 0
     best_model_epoch = 0
+    num_classes = len(class_names)
     space_loss = torch.zeros(1).to(opt.device)
     loss_ADD_1=torch.zeros(1).to(opt.device)
     loss_ADD_2=torch.zeros(1).to(opt.device)
@@ -107,6 +144,8 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                 student.eval()
                 ldr = val_loader
                 val_acc_num = 0
+                val_preds = []
+                val_labels = []
             summary = []
             sample_num = 0
             for batch in tqdm(ldr, leave=False):
@@ -147,8 +186,12 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                 else:
                     sample_num += wli_img.shape[0]
                     val_acc_num = val_acc_num+acc_wli
-  
-            summary = np.array(summary).mean(axis=0)
+                    pred_label = torch.argmax(pred_wli, dim=-1)
+                    val_preds.extend(pred_label.detach().cpu().numpy().tolist())
+                    val_labels.extend(label.detach().cpu().numpy().tolist())
+
+            if len(summary) > 0:
+                summary = np.array(summary).mean(axis=0)
             
             if phase == 'train':
                 train_acc=train_acc_num / sample_num
@@ -163,21 +206,45 @@ def train(teacher, student,embed_layer_, epochs=1000, is_test=True):
                 print('[TRAIN] Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, logit_loss: %0.2f, loss_ADD_1: %0.2f, loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3], summary[4]))#
                 #save_model(epoch)
             else:
-                val_acc=val_acc_num / sample_num
-                # logging.info('epoch: {},  test_acc: {}'.format(epoch, val_acc))
-                if val_acc > val_acc_best:
-                    if val_acc < train_acc:
-                        val_acc_best = val_acc
-                        best_model_epoch = epoch
-                        save_model(epoch)
-                    else:   
-                        print('In epoch {} val_acc exceeds train_acc, not updating best model'.format(epoch))
-                        logging.info('In epoch {} val_acc exceeds train_acc, not updating best model'.format(epoch))
-                print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best), 'best_epoch: %d' % best_model_epoch)
-                logging.info('[EVAL] Epoch %d, ' % epoch + 'val_acc: %0.2f, best_acc: %0.3f, ' % (val_acc, val_acc_best) + 'best_epoch: %d' % best_model_epoch)
-                # print('best is ', val_acc_best)
-                # logging.info('##############################################################################best:{}'.format(val_acc_best))
-                # print('[EVAL] Epoch %d' % epoch, 'val_acc: %0.2f, best_acc: %0.3f' % (val_acc, val_acc_best))
+                val_acc = float(val_acc_num / sample_num)
+                confusion_matrix = compute_confusion_matrix(val_labels, val_preds, num_classes)
+                recall_per_class, f1_per_class, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
+
+                if val_macro_f1 > val_macro_f1_best:
+                    val_macro_f1_best = val_macro_f1
+                    val_acc_best = val_acc
+                    best_model_epoch = epoch
+                    save_model(epoch)
+
+                recall_msg = ', '.join([
+                    '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
+                    for idx in range(num_classes)
+                ])
+                f1_msg = ', '.join([
+                    '{}:{:.4f}'.format(class_names[idx], f1_per_class[idx])
+                    for idx in range(num_classes)
+                ])
+
+                print(
+                    '[EVAL] Epoch %d' % epoch,
+                    'val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
+                    % (val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+                )
+                print('[EVAL] recall_per_class -> {}'.format(recall_msg))
+                print('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+
+                logging.info(
+                    '[EVAL] Epoch %d, val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
+                    % (epoch, val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+                )
+                logging.info('[EVAL] recall_per_class -> {}'.format(recall_msg))
+                logging.info('[EVAL] f1_per_class -> {}'.format(f1_msg))
+                logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+
+                tb_writer.add_scalar('val_acc', val_acc, epoch)
+                tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
+                for idx in range(num_classes):
+                    tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
         
 
 if __name__ == '__main__':
@@ -190,7 +257,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type = str, default = f'./log/ADD/{timestamp}/{i}')
         parser.add_argument('--fold', type = int, default = i)
-        parser.add_argument('--batch_size', type = int, default = 4)   
+        parser.add_argument('--batch_size', type = int, default = 16)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
@@ -209,8 +276,9 @@ if __name__ == '__main__':
 
         dataset = MultiClassPairDataset(root_dir='./my_dataset', split='train', enable_aug=True, target_size=448)
         val_dataset = MultiClassPairDataset(root_dir='./my_dataset', split='val', enable_aug=False, target_size=448)
-        loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=opt.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=1, num_workers=opt.batch_size, shuffle=False)
+        class_names = [name for name, idx in sorted(val_dataset.class_map.items(), key=lambda x: x[1])]
+        loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=8, shuffle=True, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, pin_memory=True, persistent_workers=True)
 
         ce_loss = nn.CrossEntropyLoss()
         sim_loss = torch.nn.CosineEmbeddingLoss()
@@ -220,4 +288,4 @@ if __name__ == '__main__':
         embed_layer_=embed_layer().to(opt.device)
         teacher, student = load_pretrained(teacher, student, scratch=False)
         tb_writer = SummaryWriter(opt.train_save + '/run/')
-        train(teacher, student,embed_layer_, is_test = is_test,epochs = opt.epochs)
+        train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs)

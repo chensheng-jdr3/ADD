@@ -5,6 +5,7 @@ import imageio
 from scipy.ndimage import rotate
 from skimage.transform import resize
 from torch.utils.data import Dataset
+import torch
 import os
 import csv
 
@@ -39,8 +40,8 @@ class CPCDataset(Dataset):
         # augmentation
         if self.is_train and self.enable_aug:
             angle = random.randint(-180, 180)
-            wli_img = rotate(wli_img, angle)
-            nbi_img = rotate(nbi_img, angle)
+            wli_img = rotate(wli_img, angle, reshape=False)
+            nbi_img = rotate(nbi_img, angle, reshape=False)
 
             if random.random() > 0.5:
                 nbi_img = np.flip(nbi_img, 0)
@@ -91,6 +92,7 @@ class MultiClassPairDataset(Dataset):
         self.class_map = class_map
 
         self.samples = []
+        self.cached_samples = []
         label_stats = {v: 0 for v in class_map.values()}
 
         split_dir = os.path.join(root_dir, split)
@@ -120,6 +122,7 @@ class MultiClassPairDataset(Dataset):
                     self.samples.append((wli_path, nbi_path, label, patient_name, self.split))
                     label_stats[label] = label_stats.get(label, 0) + 1
 
+        self._build_cache()
         print('multiclass:', label_stats)
 
     def _collect_images(self, folder):
@@ -208,17 +211,34 @@ class MultiClassPairDataset(Dataset):
             img = img[..., :3]
         return img
 
+    def _preprocess_image(self, img_path):
+        img = imageio.imread(img_path)
+        img = self._ensure_3ch(img)
+
+        if self.target_size is not None:
+            if isinstance(self.target_size, int):
+                size = (self.target_size, self.target_size)
+            else:
+                size = self.target_size
+            img = resize(img, size)
+
+        return np.ascontiguousarray(img.astype(np.float32))
+
+    def _build_cache(self):
+        for wli_path, nbi_path, label, patient_name, set_property in self.samples:
+            wli_img = self._preprocess_image(wli_path)
+            nbi_img = self._preprocess_image(nbi_path)
+            self.cached_samples.append((wli_img, nbi_img, label, wli_path, nbi_path, patient_name, set_property))
+
     def __getitem__(self, index):
-        wli_path, nbi_path, label, patient_name, set_property = self.samples[index]
-        wli_img = imageio.imread(wli_path)
-        nbi_img = imageio.imread(nbi_path)
-        wli_img = self._ensure_3ch(wli_img)
-        nbi_img = self._ensure_3ch(nbi_img)
+        wli_img, nbi_img, label, wli_path, nbi_path, patient_name, set_property = self.cached_samples[index]
+        wli_img = wli_img.copy()
+        nbi_img = nbi_img.copy()
 
         if self.is_train and self.enable_aug:
             angle = random.randint(-180, 180)
-            wli_img = rotate(wli_img, angle)
-            nbi_img = rotate(nbi_img, angle)
+            wli_img = rotate(wli_img, angle, reshape=False)
+            nbi_img = rotate(nbi_img, angle, reshape=False)
 
             if random.random() > 0.5:
                 wli_img = np.flip(wli_img, 0)
@@ -227,18 +247,21 @@ class MultiClassPairDataset(Dataset):
             if random.random() > 0.5:
                 wli_img = np.flip(wli_img, 1)
                 nbi_img = np.flip(nbi_img, 1)
+        # ensure arrays have positive strides and are contiguous before collate
+        wli_img = np.ascontiguousarray(wli_img.astype(np.float32))
+        nbi_img = np.ascontiguousarray(nbi_img.astype(np.float32))
 
-        if self.target_size is not None:
-            if isinstance(self.target_size, int):
-                size = (self.target_size, self.target_size)
-            else:
-                size = self.target_size
-            wli_img = resize(wli_img, size)
-            nbi_img = resize(nbi_img, size)
-
+        # move channels to first dim and ensure contiguous before converting to tensor
         wli_img = np.swapaxes(wli_img, 0, -1)
         nbi_img = np.swapaxes(nbi_img, 0, -1)
-        return wli_img, nbi_img, label, wli_path, nbi_path, patient_name, set_property
+        wli_img = np.ascontiguousarray(wli_img)
+        nbi_img = np.ascontiguousarray(nbi_img)
+
+        wli_tensor = torch.from_numpy(wli_img)
+        nbi_tensor = torch.from_numpy(nbi_img)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        return wli_tensor, nbi_tensor, label_tensor, wli_path, nbi_path, patient_name, set_property
 
     def __len__(self):
         return len(self.samples)
