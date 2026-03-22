@@ -50,17 +50,29 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
     return recall_per_class, f1_per_class, macro_f1
 
 
-def load_pretrained(teacher, student, scratch):
-    stu_path ='./pretrained/' + str(opt.fold) + '_student.pth'
-    tea_path = './pretrained/' + str(opt.fold) + '_teacher.pth'
+def load_pretrained(teacher, student, scratch, teacher_modality='NBI', student_modality='WLI'):
+    # prefer modality-specific pretrained files, fallback to legacy names
+    stu_path_mod = f'./pretrained/{opt.fold}_student_{student_modality}.pth'
+    tea_path_mod = f'./pretrained/{opt.fold}_teacher_{teacher_modality}.pth'
+    stu_path_legacy = f'./pretrained/{opt.fold}_student.pth'
+    tea_path_legacy = f'./pretrained/{opt.fold}_teacher.pth'
 
     if not scratch:
-        if os.path.exists(stu_path):
-            student.load_state_dict(torch.load(stu_path, map_location=opt.device), strict=False)
-            print('load stu_path compeleted')
-        if os.path.exists(tea_path):
-            teacher.load_state_dict(torch.load(tea_path, map_location=opt.device), strict=False)
-            print('load teacher compeleted')
+        # load student if exists
+        if os.path.exists(stu_path_mod):
+            student.load_state_dict(torch.load(stu_path_mod, map_location=opt.device), strict=False)
+            print(f'load student from {stu_path_mod} completed')
+        elif os.path.exists(stu_path_legacy):
+            student.load_state_dict(torch.load(stu_path_legacy, map_location=opt.device), strict=False)
+            print(f'load student from {stu_path_legacy} completed')
+
+        # load teacher if exists
+        if os.path.exists(tea_path_mod):
+            teacher.load_state_dict(torch.load(tea_path_mod, map_location=opt.device), strict=False)
+            print(f'load teacher from {tea_path_mod} completed')
+        elif os.path.exists(tea_path_legacy):
+            teacher.load_state_dict(torch.load(tea_path_legacy, map_location=opt.device), strict=False)
+            print(f'load teacher from {tea_path_legacy} completed')
     return teacher, student
 
 
@@ -72,10 +84,14 @@ def get_ce_loss(img, label, network):
     return CEloss, acc, pred, f4, f_embed
 
 
-def save_model(epoch):
+def save_model(epoch, student, train_save, student_modality=None):
     print('update model..')
-    stu_path = opt.train_save+'/weights/student_model-{}.pth'.format(epoch)
+    stu_path = train_save + '/weights/student_model-{}.pth'.format(epoch)
     torch.save(student.state_dict(), stu_path)
+    # also save to ./pretrained with modality suffix if provided
+    if student_modality is not None:
+        pretrained_path = f'./pretrained/{opt.fold}_student_{student_modality}.pth'
+        torch.save(student.state_dict(), pretrained_path)
 
 
 def cam(fmaps,model_predict,cls_idx):
@@ -114,7 +130,7 @@ def ADD(pseudo_label1, pseudo_label2, q, kv):
     return loss_align
 
 
-def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True):
+def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True, teacher_modality='NBI', student_modality='WLI'):
     optimizer_stu = torch.optim.Adam(student.parameters(), lr=1e-4, weight_decay=1e-8)
     optimizer_embed_layer=torch.optim.Adam(embed_layer_.parameters(), lr=1e-4, weight_decay=1e-8)
     psr = PSR(num_iter=10, dilations=[1,2,4,8])
@@ -149,20 +165,33 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
             summary = []
             sample_num = 0
             for batch in tqdm(ldr, leave=False):
-                wli_img, nbi_img, label= \
-                    batch[0].to(opt.device).float(), batch[1].to(opt.device).float(), batch[2].to(opt.device).long()
-                pred_nbi,f4_tea = teacher(nbi_img)
-                CE_loss, acc_wli, pred_wli, f4_stu,f_stu_att = get_ce_loss(wli_img, label, student)
+                wli_img, nbi_img, label = batch[0].to(opt.device).float(), batch[1].to(opt.device).float(), batch[2].to(opt.device).long()
+
+                # select teacher / student inputs based on modality direction
+                if teacher_modality.upper() == 'NBI' and student_modality.upper() == 'WLI':
+                    teacher_input = nbi_img
+                    student_input = wli_img
+                elif teacher_modality.upper() == 'WLI' and student_modality.upper() == 'NBI':
+                    teacher_input = wli_img
+                    student_input = nbi_img
+                else:
+                    # fallback: teacher uses nbi, student uses wli
+                    teacher_input = nbi_img
+                    student_input = wli_img
+
+                pred_tea, f4_tea = teacher(teacher_input)
+                CE_loss, acc_wli, pred_stu, f4_stu, f_stu_att = get_ce_loss(student_input, label, student)
                 if phase == 'train':
                     # train student
                     optimizer_stu.zero_grad()
                     optimizer_embed_layer.zero_grad()
                     f_tea_att = embed_layer_(f4_tea.detach())
-                    logit_loss = sim_loss(pred_nbi.detach(), pred_wli, torch.ones(1).to(opt.device))
+                    # logit distillation: align teacher logits -> student logits
+                    logit_loss = sim_loss(pred_tea.detach(), pred_stu, torch.ones(1).to(opt.device))
 
                     if epoch>0:
-                        cam1 = cam(f4_stu, pred_wli, label)
-                        cam2 = cam(f4_tea, pred_nbi, label)
+                        cam1 = cam(f4_stu, pred_stu, label)
+                        cam2 = cam(f4_tea, pred_tea, label)
 
                         pseudo_label1 = refine_cams_with_bkg(psr, wli_img, cams=cam1, cfg=opt)
                         pseudo_label2 = refine_cams_with_bkg(psr, nbi_img, cams=cam2, cfg=opt)
@@ -182,11 +211,11 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
                     summary.append((loss.item(), CE_loss.item(), logit_loss.item(), loss_ADD_1.item(),loss_ADD_2.item()))
                     # train_acc
                     train_acc_num = train_acc_num+acc_wli
-                    sample_num += wli_img.shape[0]
+                    sample_num += student_input.shape[0]
                 else:
-                    sample_num += wli_img.shape[0]
+                    sample_num += student_input.shape[0]
                     val_acc_num = val_acc_num+acc_wli
-                    pred_label = torch.argmax(pred_wli, dim=-1)
+                    pred_label = torch.argmax(pred_stu, dim=-1)
                     val_preds.extend(pred_label.detach().cpu().numpy().tolist())
                     val_labels.extend(label.detach().cpu().numpy().tolist())
 
@@ -214,7 +243,7 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
                     val_macro_f1_best = val_macro_f1
                     val_acc_best = val_acc
                     best_model_epoch = epoch
-                    save_model(epoch)
+                    save_model(epoch, student, opt.train_save, student_modality=student_modality)
 
                 recall_msg = ', '.join([
                     '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
@@ -283,9 +312,42 @@ if __name__ == '__main__':
         ce_loss = nn.CrossEntropyLoss()
         sim_loss = torch.nn.CosineEmbeddingLoss()
         
+        # 两次独立蒸馏，分别写入子目录以便对比
+        orig_train_save = opt.train_save
+
+        # 第一次：NBI -> WLI
+        mod_name = 'NBI2WLI'
+        mod_save = os.path.join(orig_train_save, mod_name)
+        os.makedirs(mod_save + '/run/', exist_ok=True)
+        os.makedirs(mod_save + '/weights/', exist_ok=True)
+        opt.train_save = mod_save
+        logfilename = opt.train_save + '/train_log.log'
+        logging.basicConfig(filename=logfilename,
+                    format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
+                    level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
+        tb_writer = SummaryWriter(opt.train_save + '/run/')
         student = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
         teacher = resnet50(pretrained=False, num_classes=4).to(opt.device)
-        embed_layer_=embed_layer().to(opt.device)
-        teacher, student = load_pretrained(teacher, student, scratch=False)
+        embed_layer_ = embed_layer().to(opt.device)
+        teacher, student = load_pretrained(teacher, student, scratch=False, teacher_modality='NBI', student_modality='WLI')
+        train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='NBI', student_modality='WLI')
+
+        # 第二次：WLI -> NBI
+        mod_name = 'WLI2NBI'
+        mod_save = os.path.join(orig_train_save, mod_name)
+        os.makedirs(mod_save + '/run/', exist_ok=True)
+        os.makedirs(mod_save + '/weights/', exist_ok=True)
+        opt.train_save = mod_save
+        logfilename = opt.train_save + '/train_log.log'
+        logging.basicConfig(filename=logfilename,
+                    format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
+                    level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
         tb_writer = SummaryWriter(opt.train_save + '/run/')
-        train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs)
+        student2 = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
+        teacher2 = resnet50(pretrained=False, num_classes=4).to(opt.device)
+        embed_layer_2 = embed_layer().to(opt.device)
+        teacher2, student2 = load_pretrained(teacher2, student2, scratch=False, teacher_modality='WLI', student_modality='NBI')
+        train(teacher2, student2, embed_layer_2, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='WLI', student_modality='NBI')
+
+        # 恢复原始路径
+        opt.train_save = orig_train_save

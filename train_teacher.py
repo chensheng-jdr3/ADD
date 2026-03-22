@@ -57,18 +57,18 @@ def get_ce_loss(img, label, network):
     return errCE, acc, pred_label
 
 
-def save_model(epoch):
+def save_model(epoch, teacher, train_save):
     print('update model..')
-    tea_path = opt.train_save+'/weights/teacher_model-{}.pth'.format(epoch)
+    tea_path = train_save + '/weights/teacher_model-{}.pth'.format(epoch)
     torch.save(teacher.state_dict(), tea_path)
 
 
-def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loader=None, i=0):
+def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loader=None, i=0, modality='NBI', train_save='./log/teacher', tb_writer=None):
     optimizer_tea = torch.optim.Adam(teacher.parameters(), lr=1e-4, weight_decay=1e-8)
     val_acc_best = 0
     val_macro_f1_best = 0
     best_model_epoch = 0
-    best_model_path = './pretrained/' + str(i) + '_teacher.pth'
+    best_model_path = './pretrained/' + str(i) + '_teacher_{}.pth'.format(modality)
     # 混淆矩阵不再另外保存为文件，改为写入日志
     num_classes = len(class_names)
     if is_test:
@@ -91,18 +91,23 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
             summary = []
             sample_num = 0
             for batch in tqdm(ldr, leave=False):
-                nbi_img, label= \
-                     batch[1].to(opt.device).float(), batch[2].to(opt.device).long()
+                # 根据模态选择输入：NBI 使用 batch[1], WLI 使用 batch[0]
+                if modality.upper() == 'WLI':
+                    img = batch[0].to(opt.device).float()
+                    label = batch[2].to(opt.device).long()
+                else:
+                    img = batch[1].to(opt.device).float()
+                    label = batch[2].to(opt.device).long()
                 optimizer_tea.zero_grad()
                 with torch.set_grad_enabled(phase == 'train'):
-                    CE_loss, acc, pred_label = get_ce_loss(nbi_img, label, teacher)
+                    CE_loss, acc, pred_label = get_ce_loss(img, label, teacher)
                 if phase == 'train':
                     CE_loss.backward()
                     optimizer_tea.step()
                     train_acc_num=train_acc_num+acc
-                    sample_num += nbi_img.shape[0]
+                    sample_num += img.shape[0]
                 else:
-                    sample_num += nbi_img.shape[0]
+                    sample_num += img.shape[0]
                     val_acc_num=val_acc_num+acc
                     val_preds.extend(pred_label.detach().cpu().numpy().tolist())
                     val_labels.extend(label.detach().cpu().numpy().tolist())
@@ -114,8 +119,9 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
                 print('##############################################################################')
                 print('[TRAIN] Epoch %d' % epoch, 'CE_loss: %0.2f, acc: %0.2f' % (summary, train_acc))
                 tags = ['train_total_loss',  'acc']
-                tb_writer.add_scalar(tags[0], summary, epoch)
-                tb_writer.add_scalar(tags[1], train_acc, epoch)
+                if tb_writer is not None:
+                    tb_writer.add_scalar(tags[0], summary, epoch)
+                    tb_writer.add_scalar(tags[1], train_acc, epoch)
                 #save_model(epoch)
             else:
                 val_acc=val_acc_num / sample_num
@@ -131,7 +137,7 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
                     val_macro_f1_best = val_macro_f1
                     val_acc_best = val_acc
                     best_model_epoch = epoch
-                    save_model(epoch)   #log中存储
+                    save_model(epoch, teacher, train_save)   #log中存储
                     torch.save(teacher.state_dict(), best_model_path)   #与train.py配合使用
                 # print('best accuracy is {} in epoch {}'.format(val_acc_best, best_model_epoch))
                 # logging.info('best accuracy is {} in epoch {}'.format(val_acc_best, best_model_epoch))
@@ -156,10 +162,11 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
                 ])))
                 logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
 
-                tb_writer.add_scalar('val_acc', val_acc, epoch)
-                tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
-                for idx in range(num_classes):
-                    tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
+                if tb_writer is not None:
+                    tb_writer.add_scalar('val_acc', val_acc, epoch)
+                    tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
+                    for idx in range(num_classes):
+                        tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
                 # logging.info('#############################################################################')
     
     
@@ -176,7 +183,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type=str, default=f'./log/teacher/{timestamp}/{i}')
         parser.add_argument('--fold', type=int, default=i)
-        parser.add_argument('--batch_size', type=int, default=16)      
+        parser.add_argument('--batch_size', type=int, default=4)      
         parser.add_argument('--epochs', type=int, default=200)               
         parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
@@ -189,17 +196,18 @@ if __name__ == '__main__':
 
         ce_loss = nn.CrossEntropyLoss()
 
-        if os.path.exists(opt.train_save + '/run/') is False:
-            os.makedirs(opt.train_save + '/run/')
-        if os.path.exists(opt.train_save + '/weights/') is False:
-            os.makedirs(opt.train_save + '/weights/')
+        # 为两个模态分别训练并保存到各自文件夹
+        for modality in ('NBI', 'WLI'):
+            mod_save = os.path.join(opt.train_save, modality)
+            os.makedirs(mod_save + '/run/', exist_ok=True)
+            os.makedirs(mod_save + '/weights/', exist_ok=True)
 
-        logfilename = opt.train_save+'/train_log.log'
-        logging.basicConfig(filename=logfilename,
-            format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
-            level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
-        tb_writer = SummaryWriter(opt.train_save+'/run/')
+            logfilename = mod_save + '/train_log.log'
+            logging.basicConfig(filename=logfilename,
+                                format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
+                                level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
+            tb_writer = SummaryWriter(mod_save + '/run/')
 
-        teacher = resnet50(pretrained=True, num_classes=4).to(opt.device)
-        train(teacher, class_names=class_names, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader, i=i)
+            teacher = resnet50(pretrained=True, num_classes=4).to(opt.device)
+            train(teacher, class_names=class_names, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader, i=i, modality=modality, train_save=mod_save, tb_writer=tb_writer)
 
