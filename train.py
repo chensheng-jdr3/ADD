@@ -186,8 +186,11 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
                     optimizer_stu.zero_grad()
                     optimizer_embed_layer.zero_grad()
                     f_tea_att = embed_layer_(f4_tea.detach())
-                    # logit distillation: align teacher logits -> student logits
-                    logit_loss = sim_loss(pred_tea.detach(), pred_stu, torch.ones(1).to(opt.device))
+                    # logit distillation: use softmax+KL divergence (classical KD), no standardization
+                    T = opt.tau
+                    p_t = F.softmax(pred_tea.detach() / T, dim=1)
+                    log_p_s = F.log_softmax(pred_stu / T, dim=1)
+                    logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (T * T)
 
                     if epoch>0:
                         cam1 = cam(f4_stu, pred_stu, label)
@@ -310,7 +313,8 @@ if __name__ == '__main__':
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, pin_memory=True, persistent_workers=True)
 
         ce_loss = nn.CrossEntropyLoss()
-        sim_loss = torch.nn.CosineEmbeddingLoss()
+        # original sim_loss (CosineEmbeddingLoss) replaced by KL-based KD below
+        sim_loss = torch.nn.CosineEmbeddingLoss()  # kept for backward compatibility (unused for KD)
         
         # 两次独立蒸馏，分别写入子目录以便对比
         orig_train_save = opt.train_save
