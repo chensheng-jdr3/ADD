@@ -183,7 +183,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
         parser.add_argument('--train_save', type=str, default=f'./log/teacher/{timestamp}/{i}')
         parser.add_argument('--fold', type=int, default=i)
-        parser.add_argument('--batch_size', type=int, default=4)      
+        parser.add_argument('--batch_size', type=int, default=16)      
         parser.add_argument('--epochs', type=int, default=200)               
         parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
