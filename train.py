@@ -15,6 +15,22 @@ from lib import resnet50, resnet50_w, embed_layer, PSR, refine_cams_with_bkg, SR
 from datetime import datetime
 
 
+def logit_standardization(x, tau=4.0, eps=1e-6, unbiased=False):
+    """Per-sample Z-score standardization of logits then scale by base temperature tau.
+
+    Args:
+        x: Tensor of shape [B, C]
+        tau: base temperature scalar to divide standardized logits
+        eps: small value to avoid division by zero
+        unbiased: whether to use unbiased estimator for std (default False)
+
+    Returns:
+        standardized logits of shape [B, C]
+    """
+    mu = x.mean(dim=1, keepdim=True)
+    sigma = x.std(dim=1, unbiased=unbiased, keepdim=True)
+    return (x - mu) / (sigma + eps) / tau
+
 def compute_confusion_matrix(labels, preds, num_classes):
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     for y_true, y_pred in zip(labels, preds):
@@ -186,11 +202,14 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
                     optimizer_stu.zero_grad()
                     optimizer_embed_layer.zero_grad()
                     f_tea_att = embed_layer_(f4_tea.detach())
-                    # logit distillation: use softmax+KL divergence (classical KD), no standardization
-                    T = opt.tau
-                    p_t = F.softmax(pred_tea.detach() / T, dim=1)
-                    log_p_s = F.log_softmax(pred_stu / T, dim=1)
-                    logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (T * T)
+                    # logit distillation: per-paper logit standardization + softmax+KL
+                    # 1) standardize teacher and student logits per-sample
+                    logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
+                    logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
+                    # 2) compute distributions and KL(p_t || p_s), scale by tau^2
+                    p_t = F.softmax(logits_t_z, dim=1)
+                    log_p_s = F.log_softmax(logits_s_z, dim=1)
+                    logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (opt.tau * opt.tau)
 
                     if epoch>0:
                         cam1 = cam(f4_stu, pred_stu, label)
