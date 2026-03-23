@@ -115,6 +115,23 @@ def cam(fmaps,model_predict,cls_idx):
     return grad_cam
 
 
+def logit_standardization(x, tau=4.0, eps=1e-6, unbiased=False):
+    """Per-sample Z-score standardization of logits then scale by base temperature tau.
+
+    Args:
+        x: Tensor of shape [B, C]
+        tau: base temperature scalar to divide standardized logits
+        eps: small value to avoid division by zero
+        unbiased: whether to use unbiased estimator for std (default False)
+
+    Returns:
+        standardized logits of shape [B, C]
+    """
+    mu = x.mean(dim=1, keepdim=True)
+    sigma = x.std(dim=1, unbiased=unbiased, keepdim=True)
+    return (x - mu) / (sigma + eps) / tau
+
+
 # The key component: Alignment-free Dense Distillation (ADD) module (in Eq. 2.1)
 def ADD(pseudo_label1, pseudo_label2, q, kv):
     # Get Semantic Relation Map (in Eq. 2.2)
@@ -187,7 +204,11 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
                     optimizer_embed_layer.zero_grad()
                     f_tea_att = embed_layer_(f4_tea.detach())
                     # logit distillation: align teacher logits -> student logits
-                    logit_loss = sim_loss(pred_tea.detach(), pred_stu, torch.ones(1).to(opt.device))
+                    # apply per-sample Z-score standardization to both teacher and student logits
+                    logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
+                    logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
+                    target = torch.ones(pred_stu.size(0)).to(opt.device)
+                    logit_loss = sim_loss(logits_t_z, logits_s_z, target)
 
                     if epoch>0:
                         cam1 = cam(f4_stu, pred_stu, label)
@@ -289,6 +310,8 @@ if __name__ == '__main__':
         parser.add_argument('--batch_size', type = int, default = 16)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
+        parser.add_argument('--tau', type=float, default=4.0, help='base temperature for logit standardization')
+        parser.add_argument('--eps', type=float, default=1e-6, help='epsilon to avoid zero std in logit standardization')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
         parser.add_argument("--low_thre", default = 0.3, type = float, help = "low_bkg_score")
         parser.add_argument("--bkg_thre", default = 0.5, type = float, help = "bkg_score")
