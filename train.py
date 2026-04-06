@@ -15,6 +15,61 @@ from lib import resnet50, resnet50_w, embed_layer, PSR, refine_cams_with_bkg, SR
 from datetime import datetime
 
 
+class _GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambd, None
+
+
+def grad_reverse(x, lambd=1.0):
+    return _GradReverse.apply(x, lambd)
+
+
+def curriculum_lambda(epoch, total_epochs, max_lambda=1.0):
+    # Cosine ramp from easy (0) to hard (max_lambda)
+    if total_epochs <= 1:
+        return float(max_lambda)
+    progress = min(max(float(epoch) / float(total_epochs - 1), 0.0), 1.0)
+    return float(max_lambda) * 0.5 * (1.0 - np.cos(np.pi * progress))
+
+
+class GlobalTemperature(nn.Module):
+    def __init__(self, tau_min=1.0, tau_max=8.0, init_tau=4.0):
+        super().__init__()
+        self.tau_min = float(tau_min)
+        self.tau_max = float(tau_max)
+        init_ratio = (float(init_tau) - self.tau_min) / max(self.tau_max - self.tau_min, 1e-6)
+        init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
+        init_logit = np.log(init_ratio / (1.0 - init_ratio))
+        self.raw = nn.Parameter(torch.tensor([init_logit], dtype=torch.float32))
+
+    def forward(self, batch_size):
+        tau = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.raw)
+        return tau.expand(batch_size, 1)
+
+
+class InstanceTemperature(nn.Module):
+    def __init__(self, in_dim, hidden_dim=64, tau_min=1.0, tau_max=8.0):
+        super().__init__()
+        self.tau_min = float(tau_min)
+        self.tau_max = float(tau_max)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        tau01 = torch.sigmoid(self.mlp(x))
+        tau = self.tau_min + (self.tau_max - self.tau_min) * tau01
+        return tau
+
+
 def compute_confusion_matrix(labels, preds, num_classes):
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     for y_true, y_pred in zip(labels, preds):
@@ -175,6 +230,27 @@ def parse_distill_mask(mask_str: str):
 def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True, teacher_modality='NBI', student_modality='WLI', enabled_layers=None):
     optimizer_stu = torch.optim.Adam(student.parameters(), lr=1e-4, weight_decay=1e-8)
     optimizer_embed_layer = torch.optim.Adam(embed_layers.parameters(), lr=1e-4, weight_decay=1e-8)
+
+    temp_module = None
+    optimizer_temp = None
+    if opt.ctkd_enable:
+        num_classes = len(class_names)
+        if opt.ctkd_mode == 'global':
+            temp_module = GlobalTemperature(
+                tau_min=opt.ctkd_tau_min,
+                tau_max=opt.ctkd_tau_max,
+                init_tau=opt.tau,
+            ).to(opt.device)
+        else:
+            in_dim = num_classes if opt.ctkd_instance_input == 'teacher' else (num_classes * 2)
+            temp_module = InstanceTemperature(
+                in_dim=in_dim,
+                hidden_dim=opt.ctkd_hidden,
+                tau_min=opt.ctkd_tau_min,
+                tau_max=opt.ctkd_tau_max,
+            ).to(opt.device)
+        optimizer_temp = torch.optim.Adam(temp_module.parameters(), lr=opt.ctkd_lr, weight_decay=0.0)
+
     psr = PSR(num_iter=10, dilations=[1,2,4,8])
     psr.to(opt.device)
     feature_cache = {}
@@ -238,12 +314,40 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                     if phase == 'train':
                         optimizer_stu.zero_grad()
                         optimizer_embed_layer.zero_grad()
+                        if optimizer_temp is not None:
+                            optimizer_temp.zero_grad()
 
-                        logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
-                        logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
-                        p_t = F.softmax(logits_t_z, dim=1)
-                        log_p_s = F.log_softmax(logits_s_z, dim=1)
-                        logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (opt.tau * opt.tau)
+                        if opt.ctkd_enable:
+                            # Keep logit standardization, while replacing fixed tau with curriculum-adaptive tau.
+                            logits_t_z = logit_standardization(pred_tea.detach(), tau=1.0, eps=opt.eps)
+                            logits_s_z = logit_standardization(pred_stu, tau=1.0, eps=opt.eps)
+                            curr_lambd = curriculum_lambda(
+                                epoch=epoch,
+                                total_epochs=epochs,
+                                max_lambda=opt.ctkd_lambda_max,
+                            )
+                            if opt.ctkd_mode == 'global':
+                                tau = temp_module(batch_size=pred_stu.shape[0])
+                            else:
+                                tea_logits = pred_tea.detach()
+                                if opt.ctkd_instance_input == 'teacher':
+                                    tau_input = tea_logits
+                                else:
+                                    tau_input = torch.cat([tea_logits, pred_stu.detach()], dim=1)
+                                tau = temp_module(tau_input)
+
+                            tau = torch.clamp(tau, min=opt.ctkd_tau_min, max=opt.ctkd_tau_max)
+                            tau_adv = grad_reverse(tau, curr_lambd)
+                            p_t = F.softmax(logits_t_z / tau_adv, dim=1)
+                            log_p_s = F.log_softmax(logits_s_z / tau_adv, dim=1)
+                            tau2 = (tau_adv * tau_adv).mean()
+                            logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * tau2
+                        else:
+                            logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
+                            logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
+                            p_t = F.softmax(logits_t_z, dim=1)
+                            log_p_s = F.log_softmax(logits_s_z, dim=1)
+                            logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (opt.tau * opt.tau)
 
                         space_loss = torch.zeros(1).to(opt.device)
                         loss_add_by_scale = {name: torch.zeros(1).to(opt.device) for name in layer_names}
@@ -274,6 +378,8 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                         loss.backward()
                         optimizer_embed_layer.step()
                         optimizer_stu.step()
+                        if optimizer_temp is not None:
+                            optimizer_temp.step()
                         summary.append((
                             loss.item(),
                             CE_loss.item(),
@@ -318,6 +424,11 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                     tb_writer.add_scalar(tags[6], summary[5], epoch)
                     tb_writer.add_scalar(tags[7], summary[6], epoch)
                     tb_writer.add_scalar(tags[8], summary[7], epoch)
+                    if opt.ctkd_enable:
+                        tb_writer.add_scalar('ctkd/lambda', curr_lambd, epoch)
+                        tb_writer.add_scalar('ctkd/tau_mean', tau.detach().mean().item(), epoch)
+                        tb_writer.add_scalar('ctkd/tau_min', tau.detach().min().item(), epoch)
+                        tb_writer.add_scalar('ctkd/tau_max', tau.detach().max().item(), epoch)
                     print('##############################################################################')
                     print('[TRAIN] Epoch %d' % epoch, 'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, logit_loss: %0.2f, space_loss: %0.2f, ADD_l1: %0.2f, ADD_l2: %0.2f, ADD_l3: %0.2f, ADD_l4: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3], summary[4], summary[5], summary[6], summary[7]))
                 else:
@@ -381,6 +492,14 @@ if __name__ == '__main__':
         parser.add_argument('--distill_layers', default='1111', help="4-bit mask (left->right = layer1..layer4), e.g. '0101' enables layer2 and layer4")
         parser.add_argument('--tau', type=float, default=4.0, help='base temperature for logit standardization')
         parser.add_argument('--eps', type=float, default=1e-6, help='epsilon to avoid zero std in logit standardization')
+        parser.add_argument('--ctkd_enable', action='store_true', help='enable curriculum temperature KD')
+        parser.add_argument('--ctkd_mode', type=str, default='global', choices=['global', 'instance'], help='temperature module type')
+        parser.add_argument('--ctkd_tau_min', type=float, default=1.0, help='minimum adaptive temperature')
+        parser.add_argument('--ctkd_tau_max', type=float, default=8.0, help='maximum adaptive temperature')
+        parser.add_argument('--ctkd_lambda_max', type=float, default=1.0, help='maximum curriculum coefficient for adversarial temperature')
+        parser.add_argument('--ctkd_hidden', type=int, default=64, help='hidden size for instance-level temperature MLP')
+        parser.add_argument('--ctkd_lr', type=float, default=1e-4, help='learning rate for temperature module')
+        parser.add_argument('--ctkd_instance_input', type=str, default='teacher', choices=['teacher', 'both'], help='input logits for instance-level temperature predictor')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
         parser.add_argument("--low_thre", default = 0.3, type = float, help = "low_bkg_score")
         parser.add_argument("--bkg_thre", default = 0.5, type = float, help = "bkg_score")
