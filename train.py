@@ -147,11 +147,45 @@ def ADD(pseudo_label1, pseudo_label2, q, kv):
     return loss_align
 
 
-def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True, teacher_modality='NBI', student_modality='WLI'):
+def register_backbone_feature_hooks(model, feature_cache, prefix='student'):
+    handles = []
+    for layer_name in ('layer1', 'layer2', 'layer3', 'layer4'):
+        layer = getattr(model, layer_name)
+
+        def _hook(_module, _input, output, name=layer_name):
+            feature_cache[f'{prefix}_{name}'] = output
+
+        handles.append(layer.register_forward_hook(_hook))
+    return handles
+
+
+def parse_distill_mask(mask_str: str):
+    """Parse a 4-char binary mask string (left->right = layer1..layer4).
+
+    Examples:
+        '0101' -> [False, True, False, True]
+        '1111' -> [True, True, True, True]
+    """
+    s = mask_str.strip()
+    if len(s) != 4 or any(c not in '01' for c in s):
+        raise ValueError("--distill_layers must be a 4-character binary string like '0101'")
+    return [c == '1' for c in s]
+
+
+def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True, teacher_modality='NBI', student_modality='WLI', enabled_layers=None):
     optimizer_stu = torch.optim.Adam(student.parameters(), lr=1e-4, weight_decay=1e-8)
-    optimizer_embed_layer=torch.optim.Adam(embed_layer_.parameters(), lr=1e-4, weight_decay=1e-8)
+    optimizer_embed_layer = torch.optim.Adam(embed_layers.parameters(), lr=1e-4, weight_decay=1e-8)
     psr = PSR(num_iter=10, dilations=[1,2,4,8])
     psr.to(opt.device)
+    feature_cache = {}
+    teacher_hook_handles = register_backbone_feature_hooks(teacher, feature_cache, prefix='teacher')
+    student_hook_handles = register_backbone_feature_hooks(student, feature_cache, prefix='student')
+    layer_names = ('layer1', 'layer2', 'layer3', 'layer4')
+    if enabled_layers is None:
+        enabled_layers = [True, True, True, True]
+    else:
+        if len(enabled_layers) != 4:
+            raise ValueError('enabled_layers must be a list of 4 booleans')
     
     if is_test:
         phases = ('test',)
@@ -162,140 +196,174 @@ def train(teacher, student, embed_layer_, class_names, epochs=1000, is_test=True
     val_macro_f1_best = 0
     best_model_epoch = 0
     num_classes = len(class_names)
-    space_loss = torch.zeros(1).to(opt.device)
-    loss_ADD_1=torch.zeros(1).to(opt.device)
-    loss_ADD_2=torch.zeros(1).to(opt.device)
-    for epoch in range(1, epochs):
-        for phase in iter(phases):
-            if phase == 'train':
-                teacher.eval()
-                student.train()
-                ldr = loader
-                train_acc_num = 0
-            else:
-                teacher.eval()
-                student.eval()
-                ldr = val_loader
-                val_acc_num = 0
-                val_preds = []
-                val_labels = []
-            summary = []
-            sample_num = 0
-            for batch in tqdm(ldr, leave=False):
-                wli_img, nbi_img, label = batch[0].to(opt.device).float(), batch[1].to(opt.device).float(), batch[2].to(opt.device).long()
-
-                # select teacher / student inputs based on modality direction
-                if teacher_modality.upper() == 'NBI' and student_modality.upper() == 'WLI':
-                    teacher_input = nbi_img
-                    student_input = wli_img
-                elif teacher_modality.upper() == 'WLI' and student_modality.upper() == 'NBI':
-                    teacher_input = wli_img
-                    student_input = nbi_img
-                else:
-                    # fallback: teacher uses nbi, student uses wli
-                    teacher_input = nbi_img
-                    student_input = wli_img
-
-                pred_tea, f4_tea = teacher(teacher_input)
-                CE_loss, acc_wli, pred_stu, f4_stu, f_stu_att = get_ce_loss(student_input, label, student)
+    try:
+        for epoch in range(1, epochs):
+            for phase in iter(phases):
                 if phase == 'train':
-                    # train student
-                    optimizer_stu.zero_grad()
-                    optimizer_embed_layer.zero_grad()
-                    f_tea_att = embed_layer_(f4_tea.detach())
-                    # logit distillation: align teacher logits -> student logits
-                    # apply per-sample Z-score standardization to both teacher and student logits
-                    logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
-                    logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
-                    target = torch.ones(pred_stu.size(0)).to(opt.device)
-                    logit_loss = sim_loss(logits_t_z, logits_s_z, target)
-
-                    if epoch>0:
-                        cam1 = cam(f4_stu, pred_stu, label)
-                        cam2 = cam(f4_tea, pred_tea, label)
-
-                        pseudo_label1 = refine_cams_with_bkg(psr, wli_img, cams=cam1, cfg=opt)
-                        pseudo_label2 = refine_cams_with_bkg(psr, nbi_img, cams=cam2, cfg=opt)
-
-                        loss_ADD_1 = ADD(pseudo_label1, pseudo_label2, f_tea_att, f_stu_att)
-                        loss_ADD_2 = ADD(pseudo_label2, pseudo_label1, f_stu_att, f_tea_att)
-                        space_loss = loss_ADD_1+loss_ADD_2
-
-                    loss=CE_loss + space_loss +logit_loss
-                    if not torch.isfinite(loss):
-                        print('WARNING: non-finite loss, ending training ', loss)
-                        sys.exit(1)
-
-                    loss.backward()
-                    optimizer_embed_layer.step()
-                    optimizer_stu.step()
-                    summary.append((loss.item(), CE_loss.item(), logit_loss.item(), loss_ADD_1.item(),loss_ADD_2.item()))
-                    # train_acc
-                    train_acc_num = train_acc_num+acc_wli
-                    sample_num += student_input.shape[0]
+                    teacher.eval()
+                    student.train()
+                    ldr = loader
+                    train_acc_num = 0
                 else:
-                    sample_num += student_input.shape[0]
-                    val_acc_num = val_acc_num+acc_wli
-                    pred_label = torch.argmax(pred_stu, dim=-1)
-                    val_preds.extend(pred_label.detach().cpu().numpy().tolist())
-                    val_labels.extend(label.detach().cpu().numpy().tolist())
+                    teacher.eval()
+                    student.eval()
+                    ldr = val_loader
+                    val_acc_num = 0
+                    val_preds = []
+                    val_labels = []
 
-            if len(summary) > 0:
-                summary = np.array(summary).mean(axis=0)
-            
-            if phase == 'train':
-                train_acc=train_acc_num / sample_num
-                tags = ['acc_wli','train_total_loss','CE_loss', 'logit_loss', 'loss_ADD_1','loss_ADD_2']
-                tb_writer.add_scalar(tags[0], train_acc, epoch)
-                tb_writer.add_scalar(tags[1], summary[0], epoch)
-                tb_writer.add_scalar(tags[2], summary[1], epoch)
-                tb_writer.add_scalar(tags[3], summary[2], epoch)
-                tb_writer.add_scalar(tags[4], summary[3], epoch)
-                tb_writer.add_scalar(tags[5], summary[4], epoch)
-                print('##############################################################################')
-                print('[TRAIN] Epoch %d' % epoch,'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, logit_loss: %0.2f, loss_ADD_1: %0.2f, loss_ADD_2: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3], summary[4]))#
-                #save_model(epoch)
-            else:
-                val_acc = float(val_acc_num / sample_num)
-                confusion_matrix = compute_confusion_matrix(val_labels, val_preds, num_classes)
-                recall_per_class, f1_per_class, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
+                summary = []
+                sample_num = 0
 
-                if val_macro_f1 > val_macro_f1_best:
-                    val_macro_f1_best = val_macro_f1
-                    val_acc_best = val_acc
-                    best_model_epoch = epoch
-                    save_model(epoch, student, opt.train_save, student_modality=student_modality)
+                for batch in tqdm(ldr, leave=False):
+                    wli_img = batch[0].to(opt.device).float()
+                    nbi_img = batch[1].to(opt.device).float()
+                    label = batch[2].to(opt.device).long()
 
-                recall_msg = ', '.join([
-                    '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
-                    for idx in range(num_classes)
-                ])
-                f1_msg = ', '.join([
-                    '{}:{:.4f}'.format(class_names[idx], f1_per_class[idx])
-                    for idx in range(num_classes)
-                ])
+                    if teacher_modality.upper() == 'NBI' and student_modality.upper() == 'WLI':
+                        teacher_input = nbi_img
+                        student_input = wli_img
+                    elif teacher_modality.upper() == 'WLI' and student_modality.upper() == 'NBI':
+                        teacher_input = wli_img
+                        student_input = nbi_img
+                    else:
+                        teacher_input = nbi_img
+                        student_input = wli_img
 
-                print(
-                    '[EVAL] Epoch %d' % epoch,
-                    'val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                    % (val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
-                )
-                print('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                print('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+                    pred_tea, _ = teacher(teacher_input)
+                    CE_loss, acc_wli, pred_stu, _, _ = get_ce_loss(student_input, label, student)
+                    teacher_features = {name: feature_cache[f'teacher_{name}'] for name in layer_names}
+                    student_features = {name: feature_cache[f'student_{name}'] for name in layer_names}
 
-                logging.info(
-                    '[EVAL] Epoch %d, val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                    % (epoch, val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
-                )
-                logging.info('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                logging.info('[EVAL] f1_per_class -> {}'.format(f1_msg))
-                logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+                    if phase == 'train':
+                        optimizer_stu.zero_grad()
+                        optimizer_embed_layer.zero_grad()
 
-                tb_writer.add_scalar('val_acc', val_acc, epoch)
-                tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
-                for idx in range(num_classes):
-                    tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
-        
+                        logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
+                        logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
+                        p_t = F.softmax(logits_t_z, dim=1)
+                        log_p_s = F.log_softmax(logits_s_z, dim=1)
+                        logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (opt.tau * opt.tau)
+
+                        space_loss = torch.zeros(1).to(opt.device)
+                        loss_add_by_scale = {name: torch.zeros(1).to(opt.device) for name in layer_names}
+                        if epoch > 0:
+                            for idx, layer_name in enumerate(layer_names):
+                                if not enabled_layers[idx]:
+                                    continue
+                                s_feat = student_features[layer_name]
+                                t_feat = teacher_features[layer_name]
+
+                                cam_s = cam(s_feat, pred_stu, label)
+                                cam_t = cam(t_feat, pred_tea, label)
+                                pseudo_label_s = refine_cams_with_bkg(psr, student_input, cams=cam_s, cfg=opt)
+                                pseudo_label_t = refine_cams_with_bkg(psr, teacher_input, cams=cam_t, cfg=opt)
+
+                                q_t = embed_layers[layer_name](t_feat.detach())
+                                q_s = embed_layers[layer_name](s_feat)
+                                loss_scale_1 = ADD(pseudo_label_s, pseudo_label_t, q_t, q_s)
+                                loss_scale_2 = ADD(pseudo_label_t, pseudo_label_s, q_s, q_t)
+                                loss_add_by_scale[layer_name] = loss_scale_1 + loss_scale_2
+                                space_loss = space_loss + loss_add_by_scale[layer_name]
+
+                        loss = CE_loss + space_loss + logit_loss
+                        if not torch.isfinite(loss):
+                            print('WARNING: non-finite loss, ending training ', loss)
+                            sys.exit(1)
+
+                        loss.backward()
+                        optimizer_embed_layer.step()
+                        optimizer_stu.step()
+                        summary.append((
+                            loss.item(),
+                            CE_loss.item(),
+                            logit_loss.item(),
+                            space_loss.item(),
+                            loss_add_by_scale['layer1'].item(),
+                            loss_add_by_scale['layer2'].item(),
+                            loss_add_by_scale['layer3'].item(),
+                            loss_add_by_scale['layer4'].item(),
+                        ))
+                        train_acc_num = train_acc_num + acc_wli
+                        sample_num += student_input.shape[0]
+                    else:
+                        sample_num += student_input.shape[0]
+                        val_acc_num = val_acc_num + acc_wli
+                        pred_label = torch.argmax(pred_stu, dim=-1)
+                        val_preds.extend(pred_label.detach().cpu().numpy().tolist())
+                        val_labels.extend(label.detach().cpu().numpy().tolist())
+
+                if len(summary) > 0:
+                    summary = np.array(summary).mean(axis=0)
+
+                if phase == 'train':
+                    train_acc = train_acc_num / sample_num
+                    tags = [
+                        'acc_wli',
+                        'train_total_loss',
+                        'CE_loss',
+                        'logit_loss',
+                        'space_loss',
+                        'loss_ADD_layer1',
+                        'loss_ADD_layer2',
+                        'loss_ADD_layer3',
+                        'loss_ADD_layer4',
+                    ]
+                    tb_writer.add_scalar(tags[0], train_acc, epoch)
+                    tb_writer.add_scalar(tags[1], summary[0], epoch)
+                    tb_writer.add_scalar(tags[2], summary[1], epoch)
+                    tb_writer.add_scalar(tags[3], summary[2], epoch)
+                    tb_writer.add_scalar(tags[4], summary[3], epoch)
+                    tb_writer.add_scalar(tags[5], summary[4], epoch)
+                    tb_writer.add_scalar(tags[6], summary[5], epoch)
+                    tb_writer.add_scalar(tags[7], summary[6], epoch)
+                    tb_writer.add_scalar(tags[8], summary[7], epoch)
+                    print('##############################################################################')
+                    print('[TRAIN] Epoch %d' % epoch, 'acc: %0.2f, Total_loss: %0.2f, CE_loss: %0.2f, logit_loss: %0.2f, space_loss: %0.2f, ADD_l1: %0.2f, ADD_l2: %0.2f, ADD_l3: %0.2f, ADD_l4: %0.2f' % (train_acc, summary[0], summary[1], summary[2], summary[3], summary[4], summary[5], summary[6], summary[7]))
+                else:
+                    val_acc = float(val_acc_num / sample_num)
+                    confusion_matrix = compute_confusion_matrix(val_labels, val_preds, num_classes)
+                    recall_per_class, f1_per_class, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
+
+                    if val_macro_f1 > val_macro_f1_best:
+                        val_macro_f1_best = val_macro_f1
+                        val_acc_best = val_acc
+                        best_model_epoch = epoch
+                        save_model(epoch, student, opt.train_save, student_modality=student_modality)
+
+                    recall_msg = ', '.join([
+                        '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
+                        for idx in range(num_classes)
+                    ])
+                    f1_msg = ', '.join([
+                        '{}:{:.4f}'.format(class_names[idx], f1_per_class[idx])
+                        for idx in range(num_classes)
+                    ])
+
+                    print(
+                        '[EVAL] Epoch %d' % epoch,
+                        'val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
+                        % (val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+                    )
+                    print('[EVAL] recall_per_class -> {}'.format(recall_msg))
+                    print('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+
+                    logging.info(
+                        '[EVAL] Epoch %d, val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
+                        % (epoch, val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+                    )
+                    logging.info('[EVAL] recall_per_class -> {}'.format(recall_msg))
+                    logging.info('[EVAL] f1_per_class -> {}'.format(f1_msg))
+                    logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+
+                    tb_writer.add_scalar('val_acc', val_acc, epoch)
+                    tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
+                    for idx in range(num_classes):
+                        tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
+    finally:
+        for handle in teacher_hook_handles + student_hook_handles:
+            handle.remove()
+
 
 if __name__ == '__main__':
     
@@ -310,6 +378,7 @@ if __name__ == '__main__':
         parser.add_argument('--batch_size', type = int, default = 16)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
+        parser.add_argument('--distill_layers', default='1111', help="4-bit mask (left->right = layer1..layer4), e.g. '0101' enables layer2 and layer4")
         parser.add_argument('--tau', type=float, default=4.0, help='base temperature for logit standardization')
         parser.add_argument('--eps', type=float, default=1e-6, help='epsilon to avoid zero std in logit standardization')
         parser.add_argument("--high_thre", default = 0.7, type = float, help = "high_bkg_score")
@@ -317,6 +386,7 @@ if __name__ == '__main__':
         parser.add_argument("--bkg_thre", default = 0.5, type = float, help = "bkg_score")
         parser.add_argument("--ignore_index", default = 255, type = int, help = "random index")
         opt = parser.parse_args()
+        enabled_layers = parse_distill_mask(opt.distill_layers)
         
         if os.path.exists(opt.train_save + '/run/') is False:
             os.makedirs(opt.train_save + '/run/')
@@ -351,9 +421,14 @@ if __name__ == '__main__':
         tb_writer = SummaryWriter(opt.train_save + '/run/')
         student = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
         teacher = resnet50(pretrained=False, num_classes=4).to(opt.device)
-        embed_layer_ = embed_layer().to(opt.device)
+        embed_layer_ = nn.ModuleDict({
+            'layer1': embed_layer(in_channels=256).to(opt.device),
+            'layer2': embed_layer(in_channels=512).to(opt.device),
+            'layer3': embed_layer(in_channels=1024).to(opt.device),
+            'layer4': embed_layer(in_channels=2048).to(opt.device),
+        }).to(opt.device)
         teacher, student = load_pretrained(teacher, student, scratch=False, teacher_modality='NBI', student_modality='WLI')
-        train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='NBI', student_modality='WLI')
+        train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='NBI', student_modality='WLI', enabled_layers=enabled_layers)
 
         # 第二次：WLI -> NBI
         mod_name = 'WLI2NBI'
@@ -368,9 +443,14 @@ if __name__ == '__main__':
         tb_writer = SummaryWriter(opt.train_save + '/run/')
         student2 = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
         teacher2 = resnet50(pretrained=False, num_classes=4).to(opt.device)
-        embed_layer_2 = embed_layer().to(opt.device)
+        embed_layer_2 = nn.ModuleDict({
+            'layer1': embed_layer(in_channels=256).to(opt.device),
+            'layer2': embed_layer(in_channels=512).to(opt.device),
+            'layer3': embed_layer(in_channels=1024).to(opt.device),
+            'layer4': embed_layer(in_channels=2048).to(opt.device),
+        }).to(opt.device)
         teacher2, student2 = load_pretrained(teacher2, student2, scratch=False, teacher_modality='WLI', student_modality='NBI')
-        train(teacher2, student2, embed_layer_2, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='WLI', student_modality='NBI')
+        train(teacher2, student2, embed_layer_2, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='WLI', student_modality='NBI', enabled_layers=enabled_layers)
 
         # 恢复原始路径
         opt.train_save = orig_train_save
