@@ -37,24 +37,6 @@ from lib import resnet50, resnet50_w
 # ASF Fusion Module
 # ---------------------------------------------------------------------------
 
-class ProjectionAdapter(nn.Module):
-    """Bottleneck projection: D -> hidden -> D, then D -> dim."""
-
-    def __init__(self, in_dim=2048, hidden_dim=256, out_dim=256):
-        super().__init__()
-        self.bottleneck = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, in_dim),
-        )
-        self.out_proj = nn.Linear(in_dim, out_dim)
-
-    def forward(self, x):
-        # x: [B, 2048]
-        x = self.bottleneck(x) + x  # residual
-        return self.out_proj(x)     # [B, 256]
-
-
 class MultiHeadAttention2(nn.Module):
     """Minimal MHSA for sequence length 2.
 
@@ -99,13 +81,29 @@ class ASFFusion(nn.Module):
     """
 
     def __init__(self, in_dim=2048, dim=256, gate_hidden=256, disp_hidden=512,
-                 use_mhsa=False, mhsa_heads=3):
+                 use_mhsa=False, mhsa_heads=3, use_adapter=False, adapter_hidden=256):
         super().__init__()
         self.use_mhsa = use_mhsa
 
-        # Internal projection: map input features to working dim
-        self.t_proj = nn.Linear(in_dim, dim)
-        self.s_proj = nn.Linear(in_dim, dim)
+        # Input projection: either bottleneck adapter or simple linear
+        if use_adapter:
+            # Bottleneck: in_dim -> adapter_hidden -> in_dim (residual) -> dim
+            self.t_proj = nn.Sequential(
+                nn.Linear(in_dim, adapter_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(adapter_hidden, in_dim),
+                nn.Linear(in_dim, dim),
+            )
+            self.s_proj = nn.Sequential(
+                nn.Linear(in_dim, adapter_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(adapter_hidden, in_dim),
+                nn.Linear(in_dim, dim),
+            )
+        else:
+            # Simple linear: in_dim -> dim
+            self.t_proj = nn.Linear(in_dim, dim)
+            self.s_proj = nn.Linear(in_dim, dim)
 
         if use_mhsa:
             self.mhsa = MultiHeadAttention2(dim=dim, num_heads=mhsa_heads)
@@ -246,16 +244,12 @@ def eval_single_model(model, loader, device, class_names, backbone_name='resnet5
 
 
 def eval_fusion(model_nbi, model_wli, fusion_net, classifier, loader, device, class_names,
-                proj_adapter_nbi=None, proj_adapter_wli=None, lambda_theta=0.1):
+                lambda_theta=0.1):
     """Evaluate the full fusion pipeline."""
     model_nbi.eval()
     model_wli.eval()
     fusion_net.eval()
     classifier.eval()
-    if proj_adapter_nbi is not None:
-        proj_adapter_nbi.eval()
-    if proj_adapter_wli is not None:
-        proj_adapter_wli.eval()
 
     num_classes = len(class_names)
     all_preds, all_labels = [], []
@@ -268,11 +262,6 @@ def eval_fusion(model_nbi, model_wli, fusion_net, classifier, loader, device, cl
 
             _, nbi_feat = extract_global_feature(model_nbi, nbi_img, 'resnet50')
             _, wli_feat = extract_global_feature(model_wli, wli_img, 'resnet50_w')
-
-            if proj_adapter_nbi is not None:
-                nbi_feat = proj_adapter_nbi(nbi_feat)
-            if proj_adapter_wli is not None:
-                wli_feat = proj_adapter_wli(wli_feat)
 
             z = fusion_net(nbi_feat, wli_feat, lambda_theta=lambda_theta)
             logits = classifier(z)
@@ -291,16 +280,11 @@ def eval_fusion(model_nbi, model_wli, fusion_net, classifier, loader, device, cl
 # ---------------------------------------------------------------------------
 
 def train_fusion(model_nbi, model_wli, fusion_net, classifier,
-                 proj_adapter_nbi, proj_adapter_wli,
                  train_loader, val_loader, class_names, device,
                  epochs=100, lr=1e-4, lambda_theta=0.1,
                  train_save='./log/fusion'):
     # Collect all trainable parameters
     trainable_params = list(fusion_net.parameters()) + list(classifier.parameters())
-    if proj_adapter_nbi is not None:
-        trainable_params += list(proj_adapter_nbi.parameters())
-    if proj_adapter_wli is not None:
-        trainable_params += list(proj_adapter_wli.parameters())
 
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-8)
     ce_loss = nn.CrossEntropyLoss()
@@ -320,10 +304,6 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
         # ---- Train ----
         fusion_net.train()
         classifier.train()
-        if proj_adapter_nbi is not None:
-            proj_adapter_nbi.train()
-        if proj_adapter_wli is not None:
-            proj_adapter_wli.train()
 
         epoch_loss = 0.0
         epoch_acc_num = 0
@@ -337,11 +317,6 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
             with torch.no_grad():
                 _, nbi_feat = extract_global_feature(model_nbi, nbi_img, 'resnet50')
                 _, wli_feat = extract_global_feature(model_wli, wli_img, 'resnet50_w')
-
-            if proj_adapter_nbi is not None:
-                nbi_feat = proj_adapter_nbi(nbi_feat)
-            if proj_adapter_wli is not None:
-                wli_feat = proj_adapter_wli(wli_feat)
 
             z = fusion_net(nbi_feat, wli_feat, lambda_theta=lambda_theta)
             logits = classifier(z)
@@ -362,8 +337,7 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
         # ---- Eval ----
         acc, macro_f1, recall, f1, cm = eval_fusion(
             model_nbi, model_wli, fusion_net, classifier,
-            val_loader, device, class_names,
-            proj_adapter_nbi, proj_adapter_wli, lambda_theta,
+            val_loader, device, class_names, lambda_theta,
         )
 
         if macro_f1 > best_macro_f1:
@@ -374,8 +348,6 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
             torch.save({
                 'fusion_net': fusion_net.state_dict(),
                 'classifier': classifier.state_dict(),
-                'proj_adapter_nbi': proj_adapter_nbi.state_dict() if proj_adapter_nbi is not None else None,
-                'proj_adapter_wli': proj_adapter_wli.state_dict() if proj_adapter_wli is not None else None,
                 'epoch': epoch,
                 'macro_f1': macro_f1,
             }, save_path)
@@ -405,15 +377,10 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
     ckpt = torch.load(os.path.join(train_save, 'weights', 'best_fusion.pth'), map_location=device)
     fusion_net.load_state_dict(ckpt['fusion_net'])
     classifier.load_state_dict(ckpt['classifier'])
-    if proj_adapter_nbi is not None:
-        proj_adapter_nbi.load_state_dict(ckpt['proj_adapter_nbi'])
-    if proj_adapter_wli is not None:
-        proj_adapter_wli.load_state_dict(ckpt['proj_adapter_wli'])
 
     fus_acc, fus_f1, fus_rec, fus_f1s, fus_cm = eval_fusion(
         model_nbi, model_wli, fusion_net, classifier,
-        val_loader, device, class_names,
-        proj_adapter_nbi, proj_adapter_wli, lambda_theta,
+        val_loader, device, class_names, lambda_theta,
     )
 
     print(f'NBI only  -> acc={nbi_acc:.4f} macro_f1={nbi_f1:.4f}')
@@ -534,20 +501,15 @@ if __name__ == '__main__':
     logging.info(f'WLI baseline -> acc={wli_acc:.4f} macro_f1={wli_f1:.4f}')
 
     # Build fusion components
-    proj_nbi = ProjectionAdapter(in_dim=2048, hidden_dim=256, out_dim=opt.dim) if opt.proj_adapter else None
-    proj_wli = ProjectionAdapter(in_dim=2048, hidden_dim=256, out_dim=opt.dim) if opt.proj_adapter else None
-
-    if proj_nbi is not None:
-        proj_nbi = proj_nbi.to(device)
-    if proj_wli is not None:
-        proj_wli = proj_wli.to(device)
-
     fusion_net = ASFFusion(
+        in_dim=2048,
         dim=opt.dim,
         gate_hidden=opt.gate_hidden,
         disp_hidden=opt.disp_hidden,
         use_mhsa=opt.use_mhsa,
         mhsa_heads=opt.mhsa_heads,
+        use_adapter=opt.proj_adapter,
+        adapter_hidden=256,
     ).to(device)
 
     classifier = nn.Linear(opt.dim, num_classes).to(device)
@@ -555,16 +517,11 @@ if __name__ == '__main__':
     # Print parameter counts
     total_params = sum(p.numel() for p in fusion_net.parameters())
     total_params += sum(p.numel() for p in classifier.parameters())
-    if proj_nbi is not None:
-        total_params += sum(p.numel() for p in proj_nbi.parameters())
-    if proj_wli is not None:
-        total_params += sum(p.numel() for p in proj_wli.parameters())
     print(f'Trainable parameters: {total_params:,}')
     logging.info(f'Trainable parameters: {total_params:,}')
 
     train_fusion(
         model_nbi, model_wli, fusion_net, classifier,
-        proj_nbi, proj_wli,
         train_loader, val_loader, class_names, device,
         epochs=opt.epochs, lr=opt.lr,
         lambda_theta=opt.lambda_theta,
