@@ -98,10 +98,14 @@ class ASFFusion(nn.Module):
     Forward returns fused feature z: [B, 256].
     """
 
-    def __init__(self, dim=256, gate_hidden=256, disp_hidden=512,
+    def __init__(self, in_dim=2048, dim=256, gate_hidden=256, disp_hidden=512,
                  use_mhsa=False, mhsa_heads=3):
         super().__init__()
         self.use_mhsa = use_mhsa
+
+        # Internal projection: map input features to working dim
+        self.t_proj = nn.Linear(in_dim, dim)
+        self.s_proj = nn.Linear(in_dim, dim)
 
         if use_mhsa:
             self.mhsa = MultiHeadAttention2(dim=dim, num_heads=mhsa_heads)
@@ -122,12 +126,15 @@ class ASFFusion(nn.Module):
     def forward(self, t_feat, s_feat, lambda_theta=0.1):
         """
         Args:
-            t_feat: teacher (NBI) feature [B, dim]
-            s_feat: student (WLI) feature [B, dim] or [B, 2, dim] if MHSA
+            t_feat: teacher (NBI) feature [B, in_dim]
+            s_feat: student (WLI) feature [B, in_dim]
             lambda_theta: scaling factor threshold (TelME Eq.19)
         Returns:
             z: fused feature [B, dim]
         """
+        t_feat = self.t_proj(t_feat)  # [B, dim]
+        s_feat = self.s_proj(s_feat)  # [B, dim]
+
         if self.use_mhsa:
             # Stack teacher + student as length-2 sequence
             tokens = torch.stack([t_feat, s_feat], dim=1)  # [B, 2, dim]
