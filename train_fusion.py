@@ -235,7 +235,7 @@ def eval_single_model(model, loader, device, class_names, backbone_name='resnet5
             logits, _ = extract_global_feature(model, inp, backbone_name)
             pred = torch.argmax(logits, dim=1).cpu().numpy().tolist()
             all_preds.extend(pred)
-            all_labels.extend(label.numpy().tolist())
+            all_labels.extend(label.cpu().numpy().tolist())
 
     acc = float(np.mean(np.array(all_preds) == np.array(all_labels))) if all_labels else 0.0
     cm = compute_confusion_matrix(all_labels, all_preds, num_classes)
@@ -415,9 +415,9 @@ if __name__ == '__main__':
     parser.add_argument('--root', default='./my_dataset', help='dataset root')
 
     # Model checkpoints
-    parser.add_argument('--nbi_ckpt', type=str, default=None,
+    parser.add_argument('--nbi_ckpt', type=str, default='/root/autodl-tmp/ADD/pretrained/0_teacher_NBI.pth',
                         help='path to frozen NBI teacher checkpoint')
-    parser.add_argument('--wli_ckpt', type=str, default=None,
+    parser.add_argument('--wli_ckpt', type=str, default='/root/autodl-tmp/ADD/pretrained/0_student_WLI.pth',
                         help='path to frozen WLI student checkpoint')
 
     # ASF config
