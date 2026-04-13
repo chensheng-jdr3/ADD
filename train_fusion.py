@@ -283,7 +283,7 @@ def eval_fusion(model_nbi, model_wli, fusion_net, classifier, loader, device, cl
             logits = classifier(z)
             pred = torch.argmax(logits, dim=1).cpu().numpy().tolist()
             all_preds.extend(pred)
-            all_labels.extend(label.numpy().tolist())
+            all_labels.extend(label.cpu().numpy().tolist())
 
     acc = float(np.mean(np.array(all_preds) == np.array(all_labels))) if all_labels else 0.0
     cm = compute_confusion_matrix(all_labels, all_preds, num_classes)
@@ -443,6 +443,10 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
               f'train_loss={train_loss:.4f} train_acc={train_acc:.4f} | '
               f'val_acc={acc:.4f} val_macro_f1={macro_f1:.4f} '
               f'best_f1={best_macro_f1:.4f}@epoch{best_epoch}')
+        logging.info(f'[{epoch:3d}/{epochs}] '
+                     f'train_loss={train_loss:.4f} train_acc={train_acc:.4f} | '
+                     f'val_acc={acc:.4f} val_macro_f1={macro_f1:.4f} '
+                     f'best_f1={best_macro_f1:.4f}@epoch{best_epoch}')
 
     # Final comparison report
     print('\n===== Final Comparison =====')
@@ -500,11 +504,11 @@ if __name__ == '__main__':
                         help='path to frozen WLI student checkpoint')
 
     # ASF config
-    parser.add_argument('--proj_adapter', action='store_true',
+    parser.add_argument('--proj_adapter', action='store_true', default=False,
                         help='enable projection adapters before ASF')
-    parser.add_argument('--use_mhsa', action='store_true',
+    parser.add_argument('--use_mhsa', action='store_true', default=True,
                         help='enable multi-head self-attention over [NBI, WLI] tokens')
-    parser.add_argument('--mhsa_heads', type=int, default=3,
+    parser.add_argument('--mhsa_heads', type=int, default=2,
                         help='number of attention heads (sequence length=2)')
     parser.add_argument('--lambda_theta', type=float, default=0.05,
                         help='scaling factor threshold (fixed, TelME uses 0.1 for MELD)')
