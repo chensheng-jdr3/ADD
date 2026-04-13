@@ -109,8 +109,9 @@ class ASFFusion(nn.Module):
             self.mhsa = MultiHeadAttention2(dim=dim, num_heads=mhsa_heads)
 
         # Gate: concat(teacher_feat, student_feat) -> gate_hidden (sigmoid)
+        # change gate to output a scalar per sample (alpha) to avoid per-dim destructive scaling
         self.gate_fc = nn.Sequential(
-            nn.Linear(dim * 2, gate_hidden),
+            nn.Linear(dim * 2, 1),
             nn.Sigmoid(),
         )
 
@@ -296,13 +297,22 @@ def eval_fusion(model_nbi, model_wli, fusion_net, classifier, loader, device, cl
 
 def train_fusion(model_nbi, model_wli, fusion_net, classifier,
                  train_loader, val_loader, class_names, device,
-                 epochs=100, lr=1e-4, lambda_theta=0.1,
+                 epochs=100, lr=1e-4, lambda_theta=0.1, w_cos=0.01,
                  train_save='./log/fusion'):
     # Collect all trainable parameters
     trainable_params = list(fusion_net.parameters()) + list(classifier.parameters())
 
+    # compute class weights from training dataset to mitigate imbalance
+    num_classes = len(class_names)
+    labels = [s[2] for s in train_loader.dataset.samples]
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+    # inverse frequency, normalized
+    inv_freq = 1.0 / (counts + 1e-8)
+    class_weights = inv_freq / (inv_freq.sum() + 1e-8) * float(num_classes)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+
+    ce_loss = nn.CrossEntropyLoss(weight=class_weights_tensor)
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
-    ce_loss = nn.CrossEntropyLoss()
 
     # Freeze backbones
     model_nbi.eval()
@@ -366,13 +376,21 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
                     cos_z_t.append(cos)
                 except Exception:
                     pass
-            loss = ce_loss(logits, label)
+            base_loss = ce_loss(logits, label)
+
+            # cosine regularization: encourage fused vector to keep some alignment with teacher
+            z_n = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+            t_n = nbi_feat / (nbi_feat.norm(dim=1, keepdim=True) + 1e-8)
+            cos_mean = (z_n * t_n).sum(dim=1).mean()
+            cos_reg = (1.0 - cos_mean)
+
+            total_loss = base_loss + w_cos * cos_reg
 
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss += total_loss.item()
             pred_label = torch.argmax(logits, dim=1)
             epoch_acc_num += (pred_label == label).sum().item()
             sample_num += label.shape[0]
@@ -488,8 +506,10 @@ if __name__ == '__main__':
                         help='enable multi-head self-attention over [NBI, WLI] tokens')
     parser.add_argument('--mhsa_heads', type=int, default=3,
                         help='number of attention heads (sequence length=2)')
-    parser.add_argument('--lambda_theta', type=float, default=0.1,
+    parser.add_argument('--lambda_theta', type=float, default=0.05,
                         help='scaling factor threshold (fixed, TelME uses 0.1 for MELD)')
+    parser.add_argument('--w_cos', type=float, default=0.01,
+                        help='weight for cosine regularization term (1 - cos(z, t))')
     parser.add_argument('--dim', type=int, default=128,
                         help='latent feature dimension for ASF')
     parser.add_argument('--gate_hidden', type=int, default=128,
@@ -586,5 +606,6 @@ if __name__ == '__main__':
         train_loader, val_loader, class_names, device,
         epochs=opt.epochs, lr=opt.lr,
         lambda_theta=opt.lambda_theta,
+        w_cos=opt.w_cos,
         train_save=opt.train_save,
     )
