@@ -139,8 +139,13 @@ class ASFFusion(nn.Module):
             s_feat = self.mhsa(tokens)                       # [B, dim]
 
         gate = self.gate_fc(torch.cat([t_feat, s_feat], dim=1))  # [B, dim]
+
+        # Displacement: normalize to avoid unbounded magnitude (prevents cheating by scaling)
         disp = self.disp_fc(s_feat)                               # [B, dim]
-        H = gate * disp                                           # gated displacement
+        disp_norm = torch.norm(disp, p=2, dim=1, keepdim=True)
+        disp = disp / (disp_norm + 1e-8)
+
+        H = gate * disp                                           # gated displacement (bounded)
 
         # Lambda scaling (TelME Eq.19): clamp displacement magnitude relative to teacher
         t_norm = torch.norm(t_feat, p=2, dim=1, keepdim=True)
@@ -148,6 +153,16 @@ class ASFFusion(nn.Module):
         lam = torch.clamp(t_norm / (H_norm + 1e-8) * lambda_theta, max=1.0)
 
         z = t_feat + lam * H                                      # [B, dim]
+
+        # Also return diagnostics when requested via attribute (non-breaking):
+        # store last forward stats for external logging
+        self._last_stats = {
+            'lam': lam.detach().cpu(),
+            'gate_mean': gate.detach().cpu().mean(),
+            'H_norm_mean': H_norm.detach().cpu().mean(),
+            't_norm_mean': t_norm.detach().cpu().mean(),
+        }
+
         return z
 
 
@@ -286,7 +301,7 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
     # Collect all trainable parameters
     trainable_params = list(fusion_net.parameters()) + list(classifier.parameters())
 
-    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-8)
+    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
     ce_loss = nn.CrossEntropyLoss()
 
     # Freeze backbones
@@ -309,6 +324,13 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
         epoch_acc_num = 0
         sample_num = 0
 
+        # diagnostics accumulators
+        lam_means = []
+        gate_means = []
+        H_norm_means = []
+        t_norm_means = []
+        cos_z_t = []
+
         for batch in tqdm(train_loader, desc=f'Epoch {epoch}', leave=False):
             wli_img = batch[0].to(device).float()
             nbi_img = batch[1].to(device).float()
@@ -320,6 +342,30 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
 
             z = fusion_net(nbi_feat, wli_feat, lambda_theta=lambda_theta)
             logits = classifier(z)
+            # collect diagnostics if present on fusion_net
+            if hasattr(fusion_net, '_last_stats'):
+                s = fusion_net._last_stats
+                try:
+                    lam_means.append(float(s['lam'].mean().item()))
+                except Exception:
+                    pass
+                try:
+                    gate_means.append(float(s['gate_mean'].item()))
+                    H_norm_means.append(float(s['H_norm_mean'].item()))
+                    t_norm_means.append(float(s['t_norm_mean'].item()))
+                except Exception:
+                    pass
+                # cos similarity between z and t_feat
+                try:
+                    z_cpu = z.detach().cpu()
+                    t_cpu = nbi_feat.detach().cpu()
+                    # reduce to batch-level mean cosine
+                    z_n = z_cpu / (z_cpu.norm(dim=1, keepdim=True) + 1e-8)
+                    t_n = t_cpu / (t_cpu.norm(dim=1, keepdim=True) + 1e-8)
+                    cos = (z_n * t_n).sum(dim=1).mean().item()
+                    cos_z_t.append(cos)
+                except Exception:
+                    pass
             loss = ce_loss(logits, label)
 
             optimizer.zero_grad()
@@ -335,6 +381,21 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
         train_acc = epoch_acc_num / sample_num
 
         # ---- Eval ----
+        # --- diagnostics logging ---
+        if len(lam_means) > 0:
+            lam_epoch_mean = float(np.mean(lam_means))
+        else:
+            lam_epoch_mean = 0.0
+        gate_epoch_mean = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
+        H_norm_epoch_mean = float(np.mean(H_norm_means)) if len(H_norm_means) > 0 else 0.0
+        t_norm_epoch_mean = float(np.mean(t_norm_means)) if len(t_norm_means) > 0 else 0.0
+        cos_z_t_epoch_mean = float(np.mean(cos_z_t)) if len(cos_z_t) > 0 else 0.0
+        tb_writer.add_scalar('diagnostics/lam_mean', lam_epoch_mean, epoch)
+        tb_writer.add_scalar('diagnostics/gate_mean', gate_epoch_mean, epoch)
+        tb_writer.add_scalar('diagnostics/H_norm_mean', H_norm_epoch_mean, epoch)
+        tb_writer.add_scalar('diagnostics/t_norm_mean', t_norm_epoch_mean, epoch)
+        tb_writer.add_scalar('diagnostics/cos_z_t_mean', cos_z_t_epoch_mean, epoch)
+
         acc, macro_f1, recall, f1, cm = eval_fusion(
             model_nbi, model_wli, fusion_net, classifier,
             val_loader, device, class_names, lambda_theta,
@@ -412,8 +473,8 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--fold', type=int, default=0)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--device', default='cuda:0', help='e.g. cuda:0 or cpu')
     parser.add_argument('--root', default='./my_dataset', help='dataset root')
@@ -433,11 +494,11 @@ if __name__ == '__main__':
                         help='number of attention heads (sequence length=2)')
     parser.add_argument('--lambda_theta', type=float, default=0.1,
                         help='scaling factor threshold (fixed, TelME uses 0.1 for MELD)')
-    parser.add_argument('--dim', type=int, default=256,
+    parser.add_argument('--dim', type=int, default=128,
                         help='latent feature dimension for ASF')
-    parser.add_argument('--gate_hidden', type=int, default=256,
+    parser.add_argument('--gate_hidden', type=int, default=128,
                         help='gate MLP hidden dimension')
-    parser.add_argument('--disp_hidden', type=int, default=512,
+    parser.add_argument('--disp_hidden', type=int, default=256,
                         help='displacement MLP hidden dimension (strengthened)')
 
     opt = parser.parse_args()
