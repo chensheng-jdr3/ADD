@@ -157,11 +157,17 @@ class ASFFusion(nn.Module):
 
         # Also return diagnostics when requested via attribute (non-breaking):
         # store last forward stats for external logging
+        # compute cosine mean between fused z and projected teacher t_feat
+        z_n = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+        t_proj_n = t_feat / (t_feat.norm(dim=1, keepdim=True) + 1e-8)
+        cos_mean = (z_n * t_proj_n).sum(dim=1).mean().detach().cpu()
+
         self._last_stats = {
             'lam': lam.detach().cpu(),
             'gate_mean': gate.detach().cpu().mean(),
             'H_norm_mean': H_norm.detach().cpu().mean(),
             't_norm_mean': t_norm.detach().cpu().mean(),
+            'cos_mean': cos_mean,
         }
 
         return z
@@ -378,10 +384,18 @@ def train_fusion(model_nbi, model_wli, fusion_net, classifier,
                     pass
             base_loss = ce_loss(logits, label)
 
-            # cosine regularization: encourage fused vector to keep some alignment with teacher
-            z_n = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-            t_n = nbi_feat / (nbi_feat.norm(dim=1, keepdim=True) + 1e-8)
-            cos_mean = (z_n * t_n).sum(dim=1).mean()
+            # cosine regularization: use fusion_net._last_stats['cos_mean'] (computed in forward)
+            if hasattr(fusion_net, '_last_stats') and 'cos_mean' in fusion_net._last_stats:
+                cos_mean = float(fusion_net._last_stats['cos_mean'].item())
+            else:
+                # fallback: project raw nbi_feat via fusion_net.t_proj to compute cosine
+                try:
+                    t_proj = fusion_net.t_proj(nbi_feat)
+                    z_n = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+                    t_n = t_proj / (t_proj.norm(dim=1, keepdim=True) + 1e-8)
+                    cos_mean = (z_n * t_n).sum(dim=1).mean().item()
+                except Exception:
+                    cos_mean = 0.0
             cos_reg = (1.0 - cos_mean)
 
             total_loss = base_loss + w_cos * cos_reg
