@@ -518,15 +518,15 @@ if __name__ == '__main__':
                         help='path to frozen WLI student checkpoint')
 
     # ASF config
-    parser.add_argument('--proj_adapter', action='store_true', default=False,
+    parser.add_argument('--proj_adapter', action='store_true', default=True,
                         help='enable projection adapters before ASF')
-    parser.add_argument('--use_mhsa', action='store_true', default=True,
+    parser.add_argument('--use_mhsa', action='store_true', default=False,
                         help='enable multi-head self-attention over [NBI, WLI] tokens')
     parser.add_argument('--mhsa_heads', type=int, default=2,
                         help='number of attention heads (sequence length=2)')
-    parser.add_argument('--lambda_theta', type=float, default=0.05,
+    parser.add_argument('--lambda_theta', type=float, default=0.1,
                         help='scaling factor threshold (fixed, TelME uses 0.1 for MELD)')
-    parser.add_argument('--w_cos', type=float, default=0.01,
+    parser.add_argument('--w_cos', type=float, default=0,
                         help='weight for cosine regularization term (1 - cos(z, t))')
     parser.add_argument('--dim', type=int, default=128,
                         help='latent feature dimension for ASF')
