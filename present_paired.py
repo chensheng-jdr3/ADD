@@ -13,25 +13,17 @@ from preproc_dark import compute_hard_mask, compute_dark_region
 # 默认配置
 CFG = {
     "nmi_bins": 64, "ambiguity_thresh": 0.1,
-    "no_match_score_thresh": 0.6, "use_clahe": 1, "resize": 256,
+    "no_match_score_thresh": 0.6, "resize": 256,
     "percentile_p_nbi": 10, "percentile_p_wli": 10,
     "dark_range_min_ratio": 0.04,  # 灰度范围边界最小像素占比
     "dark_range_start_gray": 5,   # 从该灰度开始寻找范围边界
     "dark_soft_weight": 1,  # 暗区软权重（0=完全忽略，1=不降权）
     "similarity_method": "nmi",  # 相似性度量方法（仅支持 "nmi"）
+    "crop_box": None,  # 可选: (top, bottom, left, right) 用于裁剪输入图像
+    "ransac_ratio": 0.75,
+    "ransac_thresh": 3.0,
 }
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-
-
-def list_patients(root_dir):
-    """遍历根目录下的患者文件夹"""
-    patients = []
-    for name in sorted(os.listdir(root_dir)) if os.path.isdir(root_dir) else []:
-        pdir = os.path.join(root_dir, name)
-        nbi, wli = os.path.join(pdir, "NBI"), os.path.join(pdir, "WLI")
-        if os.path.isdir(nbi) and os.path.isdir(wli):
-            patients.append((name, nbi, wli))
-    return patients
 
 
 def list_images(folder):
@@ -57,8 +49,8 @@ def compute_weight_sift_distance(
     dist_sigma=0.3,
     other_kp=None,
     other_des=None,
-    ransac_ratio=0.75,
-    ransac_thresh=3.0,
+    ransac_ratio=None,
+    ransac_thresh=None,
 ):
     """
     权重计算方式3：SIFT关键点 + 到最近关键点的距离
@@ -83,57 +75,45 @@ def compute_weight_sift_distance(
     if dark_region is not None:
         det_mask[dark_region > 0] = 0
 
-    # 检测器（SIFT 优先，失败回退 ORB）
-    is_sift = True
-    try:
-        detector = cv2.SIFT_create(nfeatures=max_features)
-    except Exception:
-        detector = cv2.ORB_create(nfeatures=max_features)
-        is_sift = False
+    # 检测器（固定使用 SIFT）
+    detector = cv2.SIFT_create(nfeatures=max_features)
 
-    # 如果传入了其它图像的 keypoints/descriptors，则尝试使用 RANSAC 过滤内点
+    # 如果传入了其它图像的 keypoints/descriptors，则尝试使用 RANSAC 过滤内点（默认尝试）
     use_inlier_coords = None
-    if other_des is not None:
-        # 先检测并计算当前图的 keypoints + descriptors
-        kp1 = detector.detect(gray, mask=det_mask)
-        if kp1:
-            try:
-                kp1, des1 = detector.compute(gray, kp1)
-            except Exception:
-                des1 = None
-        else:
-            des1 = None
+    # 直接一次性检测并计算描述子
+    try:
+        kp1, des1 = detector.detectAndCompute(gray, mask=det_mask)
+    except Exception:
+        kp1, des1 = [], None
 
-        # 若没有描述子或对端没有描述子，退化为原方法
-        if des1 is not None and other_des is not None and len(des1) > 0 and len(other_des) > 0:
-            # 选择合适的匹配器
-            if is_sift:
-                bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-            else:
-                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    # 如果外部没有提供 ransac 参数，则使用全局 CFG 中的默认值
+    if ransac_ratio is None:
+        ransac_ratio = CFG.get("ransac_ratio", 0.75)
+    if ransac_thresh is None:
+        ransac_thresh = CFG.get("ransac_thresh", 3.0)
 
-            # KNN+ratio test
-            try:
-                matches = bf.knnMatch(des1, other_des, k=2)
-            except Exception:
-                matches = []
+    if des1 is not None and other_des is not None and len(des1) > 0 and len(other_des) > 0:
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        matches = bf.knnMatch(des1, other_des, k=2)
 
-            good = []
-            for m_n in matches:
-                if len(m_n) < 2:
-                    continue
-                m, n = m_n[0], m_n[1]
-                if m.distance < ransac_ratio * n.distance:
-                    good.append(m)
+        good = []
+        for m_n in matches:
+            if len(m_n) < 2:
+                continue
+            m, n = m_n[0], m_n[1]
+            if m.distance < ransac_ratio * n.distance:
+                good.append(m)
 
-            if len(good) >= 4:
-                src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([other_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=ransac_thresh)
-                if mask is not None:
-                    inlier_idx = [i for i, v in enumerate(mask.ravel()) if v]
-                    if inlier_idx:
-                        use_inlier_coords = [tuple(map(int, map(round, kp1[good[i].queryIdx].pt))) for i in inlier_idx]
+        if len(good) >= 4:
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([other_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=ransac_thresh)
+            if mask is not None:
+                inlier_idx = np.where(mask.ravel() != 0)[0]
+                if inlier_idx.size:
+                    coords = np.array([kp1[good[i].queryIdx].pt for i in inlier_idx])
+                    coords = np.round(coords).astype(np.int32)
+                    use_inlier_coords = [tuple(c) for c in coords]
 
     # 如果没有使用 RANSAC 内点过滤，则按原逻辑检测 keypoints 并生成 kp_map
     if use_inlier_coords is None:
@@ -184,7 +164,7 @@ compute_weight = compute_weight_sift_distance
 
 def preprocess(
     img,
-    use_clahe=0,
+    crop_box=None,
     resize=256,
     range_percent=15,
     dark_soft_weight=0.2,
@@ -198,6 +178,20 @@ def preprocess(
     if img is None:
         return None, None, None
     
+    # 可选裁剪：crop_box 格式 (top, bottom, left, right)
+    if crop_box is not None:
+        try:
+            t, b, l, r = map(int, crop_box)
+            h0, w0 = img.shape[:2]
+            t = max(0, min(h0, t))
+            b = max(0, min(h0, b))
+            l = max(0, min(w0, l))
+            r = max(0, min(w0, r))
+            if b > t and r > l:
+                img = img[t:b, l:r]
+        except Exception:
+            pass
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if resize:
         img = cv2.resize(img, (resize, resize), interpolation=cv2.INTER_AREA)
@@ -218,8 +212,7 @@ def preprocess(
     weight = compute_weight(gray, hard_mask, dark_region, dark_soft_weight)
     
     # CLAHE
-    if use_clahe:
-        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     
     # 梯度图
     gx, gy = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -298,32 +291,6 @@ def compute_weighted_nmi(img1, img2, weight1, weight2, bins=64):
 
 
 # ==================== 相似性度量选择器 ====================
-
-def compute_similarity(img1, img2, weight1, weight2, method="zncc", **kwargs):
-    """
-    统一的相似性计算接口
-    
-    参数：
-        method: 仅支持 "nmi"
-    """
-    if method != "nmi":
-        raise ValueError(f"Unknown similarity method: {method}")
-    return compute_weighted_nmi(img1, img2, weight1, weight2, **kwargs)
-
-
-def hungarian_assignment(scores, thresh):
-    """匈牙利算法"""
-    try:
-        from scipy.optimize import linear_sum_assignment
-        N, M = scores.shape
-        ext = np.full((N, M + N), thresh, dtype=np.float32)
-        ext[:, :M] = scores
-        row, col = linear_sum_assignment(-ext)
-        return [int(c) if c < M else -1 for c in col]
-    except:
-        return greedy_assignment(scores, thresh)
-
-
 def greedy_assignment(scores, thresh):
     """贪心匹配"""
     N, M = scores.shape
@@ -341,10 +308,7 @@ def draw_triplet(nbi, wli1, wli2, nw, ww1, ww2, s1, s2, path):
     h = 256
     to_panel = lambda img: cv2.resize(img, (h, h)) if img is not None else np.zeros((h, h, 3), dtype=np.uint8)
     
-    def weight_to_heatmap(w):
-        """将权重图转换为热力图"""
-        # 如果没有权重或原图均为 None，返回黑图
-        return np.zeros((h, h, 3), dtype=np.uint8)
+    # 单一定义 weight_to_heatmap 在下面，移除上方重复占位定义
 
     def weight_to_heatmap(w, orig=None, alpha=0.6):
         """将权重图转换为与原图叠加的热力图（orig 位于下层）
@@ -395,7 +359,7 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     # 预处理（返回：显示图, 梯度图, 权重图）
     load = lambda paths, key: [(path, *preprocess(
         safe_imread(path),
-        cfg["use_clahe"],
+        cfg.get("crop_box"),
         cfg["resize"],
         cfg[f"percentile_p_{key}"],
         cfg["dark_soft_weight"],
@@ -417,17 +381,30 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     # 预先创建检测器（SIFT 优先）
     try:
         detector_global = cv2.SIFT_create(nfeatures=800)
-        use_sift = True
     except Exception:
         detector_global = cv2.ORB_create(nfeatures=800)
-        use_sift = False
-
+    
     def prepare_item(item):
         path, disp, grad, weight = item
         img = safe_imread(path)
         if img is None:
             return {"path": path, "disp": disp, "grad": grad, "weight": weight,
                     "gray": None, "hard": None, "dark": None, "kp": [], "des": None}
+
+        # 可选裁剪：与 preprocess 保持一致，cfg 中 crop_box 格式 (top, bottom, left, right)
+        crop_box = cfg.get("crop_box")
+        if crop_box is not None:
+            try:
+                t, b, l, r = map(int, crop_box)
+                h0, w0 = img.shape[:2]
+                t = max(0, min(h0, t))
+                b = max(0, min(h0, b))
+                l = max(0, min(w0, l))
+                r = max(0, min(w0, r))
+                if b > t and r > l:
+                    img = img[t:b, l:r]
+            except Exception:
+                pass
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         if cfg.get("resize"):
@@ -455,66 +432,66 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     nbi_items = [prepare_item((p, d, g, w)) for p, d, g, w in nbi_data]
     wli_items = [prepare_item((p, d, g, w)) for p, d, g, w in wli_data]
 
-    # 计算相似性矩阵（支持NMI或ZNCC），在使用 SIFT 权重函数时传入对端的 kp/des 用于 RANSAC 过滤
-    sim_mat = np.zeros((N, M), dtype=np.float32)
+    # 按行在线计算相似度：对每张 NBI，逐一计算与所有 WLI 的相似度，取最高和次高
+    vis_dir = os.path.join(out_dir, "vis", pid)
+    os.makedirs(vis_dir, exist_ok=True)
+    rows, debug = [], {"patient_id": pid, "items": []}
+
     for i in range(N):
+        # 对第 i 张 NBI，遍历所有 WLI 计算相似度并记录 top1/top2
+        best_s, second_s = -1.0, -1.0
+        best_j, second_j = -1, -1
+
         for j in range(M):
             g1 = nbi_items[i]["grad"]
             g2 = wli_items[j]["grad"]
-            # 计算权重：如果当前全局 compute_weight 指向 compute_weight_sift_distance，使用 RANSAC 参数
             if compute_weight == compute_weight_sift_distance:
                 w1 = compute_weight_sift_distance(nbi_items[i]["gray"], hard_mask=nbi_items[i]["hard"], dark_region=nbi_items[i]["dark"],
                                                    dark_soft_weight=cfg.get("dark_soft_weight", 0.2), max_features=800, dist_sigma=0.3,
-                                                   other_kp=wli_items[j]["kp"], other_des=wli_items[j]["des"],
-                                                   ransac_ratio=0.75, ransac_thresh=3.0)
+                                                   other_kp=wli_items[j]["kp"], other_des=wli_items[j]["des"])
                 w2 = compute_weight_sift_distance(wli_items[j]["gray"], hard_mask=wli_items[j]["hard"], dark_region=wli_items[j]["dark"],
                                                    dark_soft_weight=cfg.get("dark_soft_weight", 0.2), max_features=800, dist_sigma=0.3,
-                                                   other_kp=nbi_items[i]["kp"], other_des=nbi_items[i]["des"],
-                                                   ransac_ratio=0.75, ransac_thresh=3.0)
+                                                   other_kp=nbi_items[i]["kp"], other_des=nbi_items[i]["des"])
             else:
                 w1 = nbi_items[i]["weight"]
                 w2 = wli_items[j]["weight"]
 
-            sim_mat[i, j] = compute_similarity(g1, g2, w1, w2, method=cfg["similarity_method"], bins=cfg["nmi_bins"])
-    
-    # 归一化到 0-1（min-max）
-    mn, mx = sim_mat.min(), sim_mat.max()
-    scores = (sim_mat - mn) / (mx - mn + 1e-12) if mx > mn else np.zeros_like(sim_mat)
-    
-    # 匹配
-    assign = (hungarian_assignment if cfg["global_assignment"] else 
-              lambda s, t: [int(np.argmax(s[i])) if s[i].max() >= t else -1 for i in range(N)])(scores, cfg["no_match_score_thresh"])
-    
-    # 输出
-    vis_dir = os.path.join(out_dir, "vis", pid)
-    os.makedirs(vis_dir, exist_ok=True)
-    rows, debug = [], {"patient_id": pid, "items": []}
-    
-    for i in range(N):
-        nbi_path, nbi_disp, _, nbi_weight = nbi_data[i]
-        base = os.path.basename(nbi_path)
-        order = np.argsort(-scores[i])
-        j1, j2 = (int(order[0]) if M >= 1 else -1), (int(order[1]) if M >= 2 else -1)
-        s1, s2 = (float(scores[i, j1]) if j1 >= 0 else 0.0), (float(scores[i, j2]) if j2 >= 0 else 0.0)
-        is_amb = 1 if s1 <= 1e-12 or (M >= 2 and (s1 - s2) / (s1 + 1e-12) < cfg["ambiguity_thresh"]) else 0
-        
-        mj = assign[i] if assign[i] is not None and assign[i] >= 0 and scores[i, assign[i]] >= cfg["no_match_score_thresh"] else -1
-        final = float(scores[i, mj]) if mj >= 0 else 0.0
-        wli_name = os.path.basename(wli_data[mj][0]) if mj >= 0 else ""
-        
-        # 仅当最终匹配分数 >= 阈值时，视为成功配对并保存可视化与记录
-        if final >= cfg.get("no_match_score_thresh", 0.6) and mj >= 0:
-            rows.append([pid, base, wli_name, final, is_amb])
+            s = compute_weighted_nmi(g1, g2, w1, w2, bins=cfg["nmi_bins"])
 
-            # 可视化（显示权重热力图）并保存
-            draw_triplet(nbi_disp, wli_data[j1][1] if j1 >= 0 else None, wli_data[j2][1] if j2 >= 0 else None,
-                         nbi_weight, wli_data[j1][3] if j1 >= 0 else None, wli_data[j2][3] if j2 >= 0 else None,
+            if s > best_s:
+                second_s, second_j = best_s, best_j
+                best_s, best_j = s, j
+            elif s > second_s:
+                second_s, second_j = s, j
+
+        # 计算不确定性指标
+        s1 = best_s if best_s >= 0 else 0.0
+        s2 = second_s if second_s >= 0 else 0.0
+        is_amb = 1 if s1 <= 1e-12 or (M >= 2 and (s1 - s2) / (s1 + 1e-12) < cfg["ambiguity_thresh"]) else 0
+
+        # 若最高分达到阈值，则视为匹配
+        if best_j >= 0 and s1 >= cfg.get("no_match_score_thresh", 0.6):
+            nbi_path, nbi_disp, _, nbi_weight = nbi_data[i]
+            base = os.path.basename(nbi_path)
+            wli_name = os.path.basename(wli_data[best_j][0])
+            rows.append([pid, base, wli_name, float(s1), is_amb])
+
+            # 可视化：使用 top1/top2 的显示图与权重
+            j1, j2 = best_j, second_j if second_j >= 0 else best_j
+            draw_triplet(nbi_data[i][1], wli_data[j1][1] if j1 >= 0 else None, wli_data[j2][1] if j2 >= 0 else None,
+                         nbi_data[i][3], wli_data[j1][3] if j1 >= 0 else None, wli_data[j2][3] if j2 >= 0 else None,
                          s1, s2, os.path.join(vis_dir, f"{os.path.splitext(base)[0]}_match.jpg"))
 
-            debug["items"].append({"nbi": base, "assigned_wli": wli_name, "assigned_score": final,
-                                   "top1_wli": os.path.basename(wli_data[j1][0]) if j1 >= 0 else "", "top1_score": s1,
-                                   "top2_wli": os.path.basename(wli_data[j2][0]) if j2 >= 0 else "", "top2_score": s2,
-                                   "is_ambiguous": is_amb})
+            debug["items"].append({
+                "nbi": base,
+                "assigned_wli": wli_name,
+                "assigned_score": float(s1),
+                "top1_wli": os.path.basename(wli_data[j1][0]) if j1 >= 0 else "",
+                "top1_score": float(s1),
+                "top2_wli": os.path.basename(wli_data[j2][0]) if j2 >= 0 else "",
+                "top2_score": float(s2),
+                "is_ambiguous": is_amb
+            })
     
     # 额外输出：在原始患者目录下写入配对 CSV（如果提供了 patient_dir）
     if patient_dir is not None and rows:
@@ -536,12 +513,11 @@ def main():
     ap = argparse.ArgumentParser(description="NBI-WLI pairing")
     ap.add_argument("--dataset_root", default="./my_dataset")
     ap.add_argument("--out_dir", default="./output/pair_images_results")
-    ap.add_argument("--global_assignment", type=int, default=1)
     for k, v in CFG.items():
         ap.add_argument(f"--{k}", type=type(v), default=v)
     
     args = ap.parse_args()
-    cfg = {**CFG, **vars(args), "global_assignment": args.global_assignment == 1}
+    cfg = {**CFG, **vars(args)}
 
     dataset_root = args.dataset_root
 
@@ -597,4 +573,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()
