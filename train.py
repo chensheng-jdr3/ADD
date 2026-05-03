@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from dataloader.loader import MultiClassPairDataset
+from dataloader.loader import MultiClassPairDataset, CPCDataset
 from tqdm import tqdm
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -109,8 +109,8 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
 
 def load_pretrained(teacher, student, scratch, teacher_modality='NBI', student_modality='WLI'):
     # prefer modality-specific pretrained files, fallback to legacy names
-    stu_path_mod = f'./pretrained/{opt.dataset_name}_{opt.fold}_student_{student_modality}.pth'
-    tea_path_mod = f'./pretrained/{opt.dataset_name}_{opt.fold}_teacher_{teacher_modality}.pth'
+    stu_path_mod = f'./pretrained/{opt.dataset}_{opt.fold}_student_{student_modality}.pth'
+    tea_path_mod = f'./pretrained/{opt.dataset}_{opt.fold}_teacher_{teacher_modality}.pth'
     stu_path_legacy = f'./pretrained/{opt.fold}_student.pth'
     tea_path_legacy = f'./pretrained/{opt.fold}_teacher.pth'
 
@@ -147,7 +147,7 @@ def save_model(epoch, student, train_save, student_modality=None):
     torch.save(student.state_dict(), stu_path)
     # also save to ./pretrained with modality suffix if provided
     if student_modality is not None:
-        pretrained_path = f'./pretrained/{opt.dataset_name}_{opt.fold}_student_{student_modality}.pth'
+        pretrained_path = f'./pretrained/{opt.dataset}_{opt.fold}_student_{student_modality}.pth'
         torch.save(student.state_dict(), pretrained_path)
 
 
@@ -505,7 +505,8 @@ if __name__ == '__main__':
         is_test = False
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--dataset_name', type=str, default='my_dataset', help='dataset identifier for model paths')
+        parser.add_argument('--dataset', type=str, default='my_dataset', choices=['my_dataset', 'cpc_paired'],
+                            help="'my_dataset' = MultiClassPairDataset, 'cpc_paired' = CPCDataset (binary)")
         parser.add_argument('--train_save', type=str, default='', help='override default save path (empty = auto)')
         parser.add_argument('--fold', type=int, default=i)
         parser.add_argument('--batch_size', type = int, default = 16)   
@@ -529,7 +530,7 @@ if __name__ == '__main__':
         parser.add_argument("--ignore_index", default = 255, type = int, help = "random index")
         opt = parser.parse_args()
         if not opt.train_save:
-            opt.train_save = f'./log/ADD/{opt.dataset_name}/{timestamp}/{i}'
+            opt.train_save = f'./log/ADD/{opt.dataset}/{timestamp}/{i}'
         enabled_layers = parse_distill_mask(opt.distill_layers)
 
         if os.path.exists(opt.train_save + '/run/') is False:
@@ -540,10 +541,16 @@ if __name__ == '__main__':
                     format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
                     level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p')
 
-        dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='train', enable_aug=True, target_size=448)
-        val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='val', enable_aug=False, target_size=448)
-        class_names = val_dataset.class_names
-        num_classes = val_dataset.num_classes
+        if opt.dataset == 'cpc_paired':
+            dataset = CPCDataset(is_train=True, split_id=opt.fold, enable_aug=True)
+            val_dataset = CPCDataset(is_train=False, split_id=opt.fold, enable_aug=False)
+            class_names = ['hyperplastic', 'adenomas']
+            num_classes = 2
+        else:
+            dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset}', split='train', enable_aug=True, target_size=448)
+            val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset}', split='val', enable_aug=False, target_size=448)
+            class_names = val_dataset.class_names
+            num_classes = val_dataset.num_classes
         loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=8, shuffle=True, pin_memory=True, persistent_workers=True)
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, pin_memory=True, persistent_workers=True)
 

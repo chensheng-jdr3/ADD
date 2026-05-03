@@ -5,7 +5,7 @@ import logging
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from dataloader.loader import MultiClassPairDataset
+from dataloader.loader import MultiClassPairDataset, CPCDataset
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from lib import resnet50
@@ -70,7 +70,7 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
     val_acc_best = 0
     val_macro_f1_best = 0
     best_model_epoch = 0
-    best_model_path = './pretrained/{}_teacher_{}_{}.pth'.format(opt.dataset_name, modality, i)
+    best_model_path = './pretrained/{}_teacher_{}_{}.pth'.format(opt.dataset, modality, i)
     # 混淆矩阵不再另外保存为文件，改为写入日志
     num_classes = len(class_names)
     if is_test:
@@ -198,7 +198,8 @@ if __name__ == '__main__':
     for i in range(1):
         is_test = False  
         parser = argparse.ArgumentParser()
-        parser.add_argument('--dataset_name', type=str, default='my_dataset', help='dataset identifier for model paths')
+        parser.add_argument('--dataset', type=str, default='my_dataset', choices=['my_dataset', 'cpc_paired'],
+                            help="'my_dataset' = MultiClassPairDataset, 'cpc_paired' = CPCDataset (binary)")
         parser.add_argument('--train_save', type=str, default='', help='override default save path (empty = auto)')
         parser.add_argument('--fold', type=int, default=i)
         parser.add_argument('--batch_size', type=int, default=16)
@@ -206,12 +207,18 @@ if __name__ == '__main__':
         parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
         if not opt.train_save:
-            opt.train_save = f'./log/teacher/{opt.dataset_name}/{timestamp}/{i}'
-        
-        dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='train', enable_aug=True, target_size=448)
-        val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='val', enable_aug=False, target_size=448)
-        class_names = val_dataset.class_names
-        num_classes = val_dataset.num_classes
+            opt.train_save = f'./log/teacher/{opt.dataset}/{timestamp}/{i}'
+
+        if opt.dataset == 'cpc_paired':
+            dataset = CPCDataset(is_train=True, split_id=opt.fold, enable_aug=True)
+            val_dataset = CPCDataset(is_train=False, split_id=opt.fold, enable_aug=False)
+            class_names = ['hyperplastic', 'adenomas']
+            num_classes = 2
+        else:
+            dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset}', split='train', enable_aug=True, target_size=448)
+            val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset}', split='val', enable_aug=False, target_size=448)
+            class_names = val_dataset.class_names
+            num_classes = val_dataset.num_classes
         loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=8, shuffle=True, persistent_workers=True, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, persistent_workers=True, pin_memory=True)
 
