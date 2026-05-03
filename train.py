@@ -109,8 +109,8 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
 
 def load_pretrained(teacher, student, scratch, teacher_modality='NBI', student_modality='WLI'):
     # prefer modality-specific pretrained files, fallback to legacy names
-    stu_path_mod = f'./pretrained/{opt.fold}_student_{student_modality}.pth'
-    tea_path_mod = f'./pretrained/{opt.fold}_teacher_{teacher_modality}.pth'
+    stu_path_mod = f'./pretrained/{opt.dataset_name}_{opt.fold}_student_{student_modality}.pth'
+    tea_path_mod = f'./pretrained/{opt.dataset_name}_{opt.fold}_teacher_{teacher_modality}.pth'
     stu_path_legacy = f'./pretrained/{opt.fold}_student.pth'
     tea_path_legacy = f'./pretrained/{opt.fold}_teacher.pth'
 
@@ -147,7 +147,7 @@ def save_model(epoch, student, train_save, student_modality=None):
     torch.save(student.state_dict(), stu_path)
     # also save to ./pretrained with modality suffix if provided
     if student_modality is not None:
-        pretrained_path = f'./pretrained/{opt.fold}_student_{student_modality}.pth'
+        pretrained_path = f'./pretrained/{opt.dataset_name}_{opt.fold}_student_{student_modality}.pth'
         torch.save(student.state_dict(), pretrained_path)
 
 
@@ -505,8 +505,9 @@ if __name__ == '__main__':
         is_test = False
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--train_save', type = str, default = f'./log/ADD/{timestamp}/{i}')
-        parser.add_argument('--fold', type = int, default = i)
+        parser.add_argument('--dataset_name', type=str, default='my_dataset', help='dataset identifier for model paths')
+        parser.add_argument('--train_save', type=str, default='', help='override default save path (empty = auto)')
+        parser.add_argument('--fold', type=int, default=i)
         parser.add_argument('--batch_size', type = int, default = 16)   
         parser.add_argument('--epochs', type = int, default = 200)      
         parser.add_argument('--device', default = 'cuda:0', help = 'device id (i.e. 0 or 0,1 or cpu)')
@@ -527,41 +528,39 @@ if __name__ == '__main__':
         parser.add_argument("--bkg_thre", default = 0.5, type = float, help = "bkg_score")
         parser.add_argument("--ignore_index", default = 255, type = int, help = "random index")
         opt = parser.parse_args()
+        if not opt.train_save:
+            opt.train_save = f'./log/ADD/{opt.dataset_name}/{timestamp}/{i}'
         enabled_layers = parse_distill_mask(opt.distill_layers)
-        
+
         if os.path.exists(opt.train_save + '/run/') is False:
             os.makedirs(opt.train_save + '/run/')
         if os.path.exists(opt.train_save + '/weights/') is False:
-            os.makedirs(opt.train_save + '/weights/')    
+            os.makedirs(opt.train_save + '/weights/')
         logging.basicConfig(filename=opt.train_save + '/train_log.log',
                     format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
                     level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p')
 
-        dataset = MultiClassPairDataset(root_dir='./my_dataset', split='train', enable_aug=True, target_size=448)
-        val_dataset = MultiClassPairDataset(root_dir='./my_dataset', split='val', enable_aug=False, target_size=448)
-        class_names = [name for name, idx in sorted(val_dataset.class_map.items(), key=lambda x: x[1])]
+        dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='train', enable_aug=True, target_size=448)
+        val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='val', enable_aug=False, target_size=448)
+        class_names = val_dataset.class_names
+        num_classes = val_dataset.num_classes
         loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=8, shuffle=True, pin_memory=True, persistent_workers=True)
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, pin_memory=True, persistent_workers=True)
 
         ce_loss = nn.CrossEntropyLoss()
         sim_loss = torch.nn.CosineEmbeddingLoss()
-        
-        # 两次独立蒸馏，分别写入子目录以便对比
-        orig_train_save = opt.train_save
 
-        # 第一次：NBI -> WLI
-        mod_name = 'NBI2WLI'
-        mod_save = os.path.join(orig_train_save, mod_name)
+        # NBI -> WLI 蒸馏
+        mod_save = opt.train_save
         os.makedirs(mod_save + '/run/', exist_ok=True)
         os.makedirs(mod_save + '/weights/', exist_ok=True)
-        opt.train_save = mod_save
-        logfilename = opt.train_save + '/train_log.log'
+        logfilename = mod_save + '/train_log.log'
         logging.basicConfig(filename=logfilename,
                     format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
                     level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
-        tb_writer = SummaryWriter(opt.train_save + '/run/')
-        student = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
-        teacher = resnet50(pretrained=False, num_classes=4).to(opt.device)
+        tb_writer = SummaryWriter(mod_save + '/run/')
+        student = resnet50_w(pretrained=True, num_classes=num_classes).to(opt.device)
+        teacher = resnet50(pretrained=False, num_classes=num_classes).to(opt.device)
         embed_layer_ = nn.ModuleDict({
             'layer1': embed_layer(in_channels=256).to(opt.device),
             'layer2': embed_layer(in_channels=512).to(opt.device),
@@ -570,28 +569,3 @@ if __name__ == '__main__':
         }).to(opt.device)
         teacher, student = load_pretrained(teacher, student, scratch=False, teacher_modality='NBI', student_modality='WLI')
         train(teacher, student, embed_layer_, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='NBI', student_modality='WLI', enabled_layers=enabled_layers)
-
-        # # 第二次：WLI -> NBI
-        # mod_name = 'WLI2NBI'
-        # mod_save = os.path.join(orig_train_save, mod_name)
-        # os.makedirs(mod_save + '/run/', exist_ok=True)
-        # os.makedirs(mod_save + '/weights/', exist_ok=True)
-        # opt.train_save = mod_save
-        # logfilename = opt.train_save + '/train_log.log'
-        # logging.basicConfig(filename=logfilename,
-        #             format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
-        #             level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
-        # tb_writer = SummaryWriter(opt.train_save + '/run/')
-        # student2 = resnet50_w(pretrained=True, num_classes=4).to(opt.device)
-        # teacher2 = resnet50(pretrained=False, num_classes=4).to(opt.device)
-        # embed_layer_2 = nn.ModuleDict({
-        #     'layer1': embed_layer(in_channels=256).to(opt.device),
-        #     'layer2': embed_layer(in_channels=512).to(opt.device),
-        #     'layer3': embed_layer(in_channels=1024).to(opt.device),
-        #     'layer4': embed_layer(in_channels=2048).to(opt.device),
-        # }).to(opt.device)
-        # teacher2, student2 = load_pretrained(teacher2, student2, scratch=False, teacher_modality='WLI', student_modality='NBI')
-        # train(teacher2, student2, embed_layer_2, class_names=class_names, is_test=is_test, epochs=opt.epochs, teacher_modality='WLI', student_modality='NBI', enabled_layers=enabled_layers)
-
-        # 恢复原始路径
-        opt.train_save = orig_train_save

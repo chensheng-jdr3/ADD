@@ -86,10 +86,18 @@ class MultiClassPairDataset(Dataset):
             class_map = {
                 '正常': 0,
                 '低瘤': 1,
-                '高瘤': 2,
-                '鳞状细胞癌': 3,
+                '高瘤': 1,
+                '鳞状细胞癌': 2,
             }
         self.class_map = class_map
+
+        # 去重后的显示名称（按 label 排序，合并类使用统一命名）
+        _unique = {}
+        for name, idx in sorted(class_map.items(), key=lambda x: x[1]):
+            if idx not in _unique:
+                _unique[idx] = name
+        self.class_names = [_unique[i] for i in range(len(_unique))]
+        self.num_classes = len(self.class_names)
 
         self.samples = []
         self.cached_samples = []

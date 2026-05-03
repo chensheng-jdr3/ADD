@@ -70,7 +70,7 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
     val_acc_best = 0
     val_macro_f1_best = 0
     best_model_epoch = 0
-    best_model_path = './pretrained/' + str(i) + '_teacher_{}.pth'.format(modality)
+    best_model_path = './pretrained/{}_teacher_{}_{}.pth'.format(opt.dataset_name, modality, i)
     # 混淆矩阵不再另外保存为文件，改为写入日志
     num_classes = len(class_names)
     if is_test:
@@ -198,16 +198,20 @@ if __name__ == '__main__':
     for i in range(1):
         is_test = False  
         parser = argparse.ArgumentParser()
-        parser.add_argument('--train_save', type=str, default=f'./log/teacher/{timestamp}/{i}')
+        parser.add_argument('--dataset_name', type=str, default='my_dataset', help='dataset identifier for model paths')
+        parser.add_argument('--train_save', type=str, default='', help='override default save path (empty = auto)')
         parser.add_argument('--fold', type=int, default=i)
-        parser.add_argument('--batch_size', type=int, default=16)      
-        parser.add_argument('--epochs', type=int, default=200)               
+        parser.add_argument('--batch_size', type=int, default=16)
+        parser.add_argument('--epochs', type=int, default=200)
         parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
         opt = parser.parse_args()
+        if not opt.train_save:
+            opt.train_save = f'./log/teacher/{opt.dataset_name}/{timestamp}/{i}'
         
-        dataset = MultiClassPairDataset(root_dir='./my_dataset', split='train', enable_aug=True, target_size=448)
-        val_dataset = MultiClassPairDataset(root_dir='./my_dataset', split='val', enable_aug=False, target_size=448)
-        class_names = [name for name, idx in sorted(val_dataset.class_map.items(), key=lambda x: x[1])]
+        dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='train', enable_aug=True, target_size=448)
+        val_dataset = MultiClassPairDataset(root_dir=f'./{opt.dataset_name}', split='val', enable_aug=False, target_size=448)
+        class_names = val_dataset.class_names
+        num_classes = val_dataset.num_classes
         loader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=8, shuffle=True, persistent_workers=True, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False, persistent_workers=True, pin_memory=True)
 
@@ -225,6 +229,6 @@ if __name__ == '__main__':
                                 level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
             tb_writer = SummaryWriter(mod_save + '/run/')
 
-            teacher = resnet50(pretrained=True, num_classes=4).to(opt.device)
+            teacher = resnet50(pretrained=True, num_classes=num_classes).to(opt.device)
             train(teacher, class_names=class_names, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader, i=i, modality=modality, train_save=mod_save, tb_writer=tb_writer)
 
