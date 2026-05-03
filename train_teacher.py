@@ -45,8 +45,10 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
         out=np.zeros_like(diagonal, dtype=np.float64),
         where=(precision_per_class + recall_per_class) != 0
     )
+    macro_recall = float(np.mean(recall_per_class))
+    macro_precision = float(np.mean(precision_per_class))
     macro_f1 = float(np.mean(f1_per_class))
-    return recall_per_class, f1_per_class, macro_f1
+    return recall_per_class, precision_per_class, f1_per_class, macro_recall, macro_precision, macro_f1
 
 
 def get_ce_loss(img, label, network):
@@ -128,45 +130,60 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
                 val_acc = float(val_acc)
 
                 confusion_matrix = compute_confusion_matrix(val_labels, val_preds, num_classes)
-                recall_per_class, f1_per_class, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
+                recall_per_class, precision_per_class, f1_per_class, macro_recall, macro_precision, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
 
-                # 混淆矩阵写入日志（不另外保存为文件）
-
-                # logging.info('epoch: {},  test_acc: {}'.format(epoch, val_acc))
-                if val_macro_f1 > val_macro_f1_best:
+                is_new_best = val_macro_f1 > val_macro_f1_best
+                if is_new_best:
                     val_macro_f1_best = val_macro_f1
                     val_acc_best = val_acc
                     best_model_epoch = epoch
                     save_model(epoch, teacher, train_save)   #log中存储
                     torch.save(teacher.state_dict(), best_model_path)   #与train.py配合使用
-                # print('best accuracy is {} in epoch {}'.format(val_acc_best, best_model_epoch))
-                # logging.info('best accuracy is {} in epoch {}'.format(val_acc_best, best_model_epoch))
-                recall_msg = ', '.join([
-                    '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
-                    for idx in range(num_classes)
-                ])
-                print(
-                    '[EVAL] Epoch %d' % epoch,
-                    'val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                    % (val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+
+                brief = (
+                    f"[EVAL] Epoch {epoch:3d} | acc={val_acc:.4f} | macro_f1={val_macro_f1:.4f} | "
+                    f"best_f1={val_macro_f1_best:.4f} (epoch {best_model_epoch})"
                 )
-                print('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                print('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
-                logging.info(
-                    '[EVAL] Epoch %d, val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                    % (epoch, val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
-                )
-                logging.info('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                logging.info('[EVAL] f1_per_class -> {}'.format(', '.join([
-                    '{}:{:.4f}'.format(class_names[idx], f1_per_class[idx]) for idx in range(num_classes)
-                ])))
-                logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+                print(brief)
+                logging.info(brief)
+
+                if is_new_best:
+                    header = f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1':>10}"
+                    sep = "-" * 44
+                    rows = []
+                    for idx in range(num_classes):
+                        rows.append(
+                            f"{class_names[idx]:<12} {precision_per_class[idx]:>10.4f} "
+                            f"{recall_per_class[idx]:>10.4f} {f1_per_class[idx]:>10.4f}"
+                        )
+                    macro_row = (
+                        f"{'Macro Avg':<12} {macro_precision:>10.4f} "
+                        f"{macro_recall:>10.4f} {val_macro_f1:>10.4f}"
+                    )
+                    detail = "\n".join([
+                        f"[EVAL] New Best at Epoch {epoch}",
+                        f"  Overall Accuracy = {val_acc:.4f}",
+                        sep,
+                        header,
+                        sep,
+                        *rows,
+                        sep,
+                        macro_row,
+                        sep,
+                        f"  Confusion Matrix:",
+                        f"{confusion_matrix}",
+                    ])
+                    print(detail)
+                    logging.info('\n' + detail)
 
                 if tb_writer is not None:
                     tb_writer.add_scalar('val_acc', val_acc, epoch)
                     tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
+                    tb_writer.add_scalar('val_macro_recall', macro_recall, epoch)
+                    tb_writer.add_scalar('val_macro_precision', macro_precision, epoch)
                     for idx in range(num_classes):
                         tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
+                        tb_writer.add_scalar('val_precision/{}'.format(class_names[idx]), precision_per_class[idx], epoch)
                 # logging.info('#############################################################################')
     
     

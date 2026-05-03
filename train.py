@@ -101,8 +101,10 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
         out=np.zeros_like(diagonal, dtype=np.float64),
         where=(precision_per_class + recall_per_class) != 0,
     )
+    macro_recall = float(np.mean(recall_per_class))
+    macro_precision = float(np.mean(precision_per_class))
     macro_f1 = float(np.mean(f1_per_class))
-    return recall_per_class, f1_per_class, macro_f1
+    return recall_per_class, precision_per_class, f1_per_class, macro_recall, macro_precision, macro_f1
 
 
 def load_pretrained(teacher, student, scratch, teacher_modality='NBI', student_modality='WLI'):
@@ -317,10 +319,16 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                         if optimizer_temp is not None:
                             optimizer_temp.zero_grad()
 
+                        # ── Logit Standardization (independent of CTKD) ──
+                        if opt.ls_enable:
+                            logits_t = logit_standardization(pred_tea.detach(), tau=1.0, eps=opt.eps)
+                            logits_s = logit_standardization(pred_stu, tau=1.0, eps=opt.eps)
+                        else:
+                            logits_t = pred_tea.detach()
+                            logits_s = pred_stu
+
+                        # ── Temperature strategy ──
                         if opt.ctkd_enable:
-                            # Keep logit standardization, while replacing fixed tau with curriculum-adaptive tau.
-                            logits_t_z = logit_standardization(pred_tea.detach(), tau=1.0, eps=opt.eps)
-                            logits_s_z = logit_standardization(pred_stu, tau=1.0, eps=opt.eps)
                             curr_lambd = curriculum_lambda(
                                 epoch=epoch,
                                 total_epochs=epochs,
@@ -329,24 +337,22 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                             if opt.ctkd_mode == 'global':
                                 tau = temp_module(batch_size=pred_stu.shape[0])
                             else:
-                                tea_logits = pred_tea.detach()
+                                tea_logits_raw = pred_tea.detach()
                                 if opt.ctkd_instance_input == 'teacher':
-                                    tau_input = tea_logits
+                                    tau_input = tea_logits_raw
                                 else:
-                                    tau_input = torch.cat([tea_logits, pred_stu.detach()], dim=1)
+                                    tau_input = torch.cat([tea_logits_raw, pred_stu.detach()], dim=1)
                                 tau = temp_module(tau_input)
 
                             tau = torch.clamp(tau, min=opt.ctkd_tau_min, max=opt.ctkd_tau_max)
                             tau_adv = grad_reverse(tau, curr_lambd)
-                            p_t = F.softmax(logits_t_z / tau_adv, dim=1)
-                            log_p_s = F.log_softmax(logits_s_z / tau_adv, dim=1)
+                            p_t = F.softmax(logits_t / tau_adv, dim=1)
+                            log_p_s = F.log_softmax(logits_s / tau_adv, dim=1)
                             tau2 = (tau_adv * tau_adv).mean()
                             logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * tau2
                         else:
-                            logits_t_z = logit_standardization(pred_tea.detach(), tau=opt.tau, eps=opt.eps)
-                            logits_s_z = logit_standardization(pred_stu, tau=opt.tau, eps=opt.eps)
-                            p_t = F.softmax(logits_t_z, dim=1)
-                            log_p_s = F.log_softmax(logits_s_z, dim=1)
+                            p_t = F.softmax(logits_t / opt.tau, dim=1)
+                            log_p_s = F.log_softmax(logits_s / opt.tau, dim=1)
                             logit_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (opt.tau * opt.tau)
 
                         space_loss = torch.zeros(1).to(opt.device)
@@ -434,43 +440,58 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
                 else:
                     val_acc = float(val_acc_num / sample_num)
                     confusion_matrix = compute_confusion_matrix(val_labels, val_preds, num_classes)
-                    recall_per_class, f1_per_class, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
+                    recall_per_class, precision_per_class, f1_per_class, macro_recall, macro_precision, val_macro_f1 = compute_metrics_from_confusion_matrix(confusion_matrix)
 
-                    if val_macro_f1 > val_macro_f1_best:
+                    is_new_best = val_macro_f1 > val_macro_f1_best
+                    if is_new_best:
                         val_macro_f1_best = val_macro_f1
                         val_acc_best = val_acc
                         best_model_epoch = epoch
                         save_model(epoch, student, opt.train_save, student_modality=student_modality)
 
-                    recall_msg = ', '.join([
-                        '{}:{:.4f}'.format(class_names[idx], recall_per_class[idx])
-                        for idx in range(num_classes)
-                    ])
-                    f1_msg = ', '.join([
-                        '{}:{:.4f}'.format(class_names[idx], f1_per_class[idx])
-                        for idx in range(num_classes)
-                    ])
-
-                    print(
-                        '[EVAL] Epoch %d' % epoch,
-                        'val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                        % (val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
+                    brief = (
+                        f"[EVAL] Epoch {epoch:3d} | acc={val_acc:.4f} | macro_f1={val_macro_f1:.4f} | "
+                        f"best_f1={val_macro_f1_best:.4f} (epoch {best_model_epoch})"
                     )
-                    print('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                    print('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+                    print(brief)
+                    logging.info(brief)
 
-                    logging.info(
-                        '[EVAL] Epoch %d, val_acc: %0.4f, val_macro_f1: %0.4f, best_macro_f1: %0.4f, best_epoch: %d'
-                        % (epoch, val_acc, val_macro_f1, val_macro_f1_best, best_model_epoch)
-                    )
-                    logging.info('[EVAL] recall_per_class -> {}'.format(recall_msg))
-                    logging.info('[EVAL] f1_per_class -> {}'.format(f1_msg))
-                    logging.info('[EVAL] confusion_matrix:\n{}'.format(confusion_matrix))
+                    if is_new_best:
+                        header = f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1':>10}"
+                        sep = "-" * 44
+                        rows = []
+                        for idx in range(num_classes):
+                            rows.append(
+                                f"{class_names[idx]:<12} {precision_per_class[idx]:>10.4f} "
+                                f"{recall_per_class[idx]:>10.4f} {f1_per_class[idx]:>10.4f}"
+                            )
+                        macro_row = (
+                            f"{'Macro Avg':<12} {macro_precision:>10.4f} "
+                            f"{macro_recall:>10.4f} {val_macro_f1:>10.4f}"
+                        )
+                        detail = "\n".join([
+                            f"[EVAL] New Best at Epoch {epoch}",
+                            f"  Overall Accuracy = {val_acc:.4f}",
+                            sep,
+                            header,
+                            sep,
+                            *rows,
+                            sep,
+                            macro_row,
+                            sep,
+                            f"  Confusion Matrix:",
+                            f"{confusion_matrix}",
+                        ])
+                        print(detail)
+                        logging.info('\n' + detail)
 
                     tb_writer.add_scalar('val_acc', val_acc, epoch)
                     tb_writer.add_scalar('val_macro_f1', val_macro_f1, epoch)
+                    tb_writer.add_scalar('val_macro_recall', macro_recall, epoch)
+                    tb_writer.add_scalar('val_macro_precision', macro_precision, epoch)
                     for idx in range(num_classes):
                         tb_writer.add_scalar('val_recall/{}'.format(class_names[idx]), recall_per_class[idx], epoch)
+                        tb_writer.add_scalar('val_precision/{}'.format(class_names[idx]), precision_per_class[idx], epoch)
     finally:
         for handle in teacher_hook_handles + student_hook_handles:
             handle.remove()
@@ -492,7 +513,8 @@ if __name__ == '__main__':
         parser.add_argument('--distill_layers', default='0001', help="4-bit mask (left->right = layer1..layer4), e.g. '0101' enables layer2 and layer4")
         parser.add_argument('--tau', type=float, default=1, help='base temperature for logit standardization')
         parser.add_argument('--eps', type=float, default=1e-6, help='epsilon to avoid zero std in logit standardization')
-        parser.add_argument('--ctkd_enable', default=True, action='store_true', help='enable curriculum temperature KD')
+        parser.add_argument('--ls_enable', default=True, action='store_true', help='enable logit standardization (Z-score)')
+        parser.add_argument('--ctkd_enable', default=True, action='store_true', help='enable curriculum temperature KD (GRL + adaptive tau)')
         parser.add_argument('--ctkd_mode', type=str, default='instatnce', choices=['global', 'instance'], help='temperature module type')
         parser.add_argument('--ctkd_tau_min', type=float, default=1.0, help='minimum adaptive temperature')
         parser.add_argument('--ctkd_tau_max', type=float, default=8.0, help='maximum adaptive temperature')
