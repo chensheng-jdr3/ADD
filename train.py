@@ -357,15 +357,20 @@ def train(teacher, student, embed_layers, class_names, epochs=1000, is_test=True
 
                         space_loss = torch.zeros(1).to(opt.device)
                         loss_add_by_scale = {name: torch.zeros(1).to(opt.device) for name in layer_names}
-                        if epoch > 0:
+                        if epoch > 0 and torch.isfinite(pred_tea).all() and torch.isfinite(pred_stu).all():
                             for idx, layer_name in enumerate(layer_names):
                                 if not enabled_layers[idx]:
                                     continue
                                 s_feat = student_features[layer_name]
                                 t_feat = teacher_features[layer_name]
+                                if not (torch.isfinite(s_feat).all() and torch.isfinite(t_feat).all()):
+                                    continue
 
-                                cam_s = cam(s_feat, pred_stu, label)
-                                cam_t = cam(t_feat, pred_tea, label)
+                                try:
+                                    cam_s = cam(s_feat, pred_stu, label)
+                                    cam_t = cam(t_feat, pred_tea, label)
+                                except RuntimeError:
+                                    continue
                                 pseudo_label_s = refine_cams_with_bkg(psr, student_input, cams=cam_s, cfg=opt)
                                 pseudo_label_t = refine_cams_with_bkg(psr, teacher_input, cams=cam_t, cfg=opt)
 
