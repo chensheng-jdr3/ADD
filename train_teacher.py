@@ -217,18 +217,17 @@ if __name__ == '__main__':
 
         ce_loss = nn.CrossEntropyLoss()
 
-        # 为两个模态分别训练并保存到各自文件夹
-        for modality in ('NBI', 'WLI'):
-            mod_save = os.path.join(opt.train_save, modality)
-            os.makedirs(mod_save + '/run/', exist_ok=True)
-            os.makedirs(mod_save + '/weights/', exist_ok=True)
+        # 训练 NBI 教师模型（用于 NBI→WLI 蒸馏）
+        mod_save = os.path.join(opt.train_save, 'NBI')
+        os.makedirs(mod_save + '/run/', exist_ok=True)
+        os.makedirs(mod_save + '/weights/', exist_ok=True)
 
-            logfilename = mod_save + '/train_log.log'
-            logging.basicConfig(filename=logfilename,
-                                format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
-                                level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
-            tb_writer = SummaryWriter(mod_save + '/run/')
+        logfilename = mod_save + '/train_log.log'
+        logging.basicConfig(filename=logfilename,
+                            format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
+                            level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p', force=True)
+        tb_writer = SummaryWriter(mod_save + '/run/')
 
-            teacher = resnet50(pretrained=True, num_classes=num_classes).to(opt.device)
-            train(teacher, class_names=class_names, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader, i=i, modality=modality, train_save=mod_save, tb_writer=tb_writer)
+        teacher = resnet50(pretrained=True, num_classes=num_classes).to(opt.device)
+        train(teacher, class_names=class_names, is_test=is_test, epochs=opt.epochs, loader=loader, val_loader=val_loader, i=i, modality='NBI', train_save=mod_save, tb_writer=tb_writer)
 
