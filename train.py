@@ -109,8 +109,8 @@ def compute_metrics_from_confusion_matrix(confusion_matrix):
 
 def load_pretrained(teacher, student, scratch, teacher_modality='NBI', student_modality='WLI'):
     # prefer modality-specific pretrained files, fallback to legacy names
-    stu_path_mod = f'./pretrained/{opt.dataset}_{opt.fold}_student_{student_modality}.pth'
-    tea_path_mod = f'./pretrained/{opt.dataset}_{opt.fold}_teacher_{teacher_modality}.pth'
+    stu_path_mod = f'./pretrained/{opt.dataset}_student_{student_modality}_{opt.fold}.pth'
+    tea_path_mod = f'./pretrained/{opt.dataset}_teacher_{teacher_modality}_{opt.fold}.pth'
     stu_path_legacy = f'./pretrained/{opt.fold}_student.pth'
     tea_path_legacy = f'./pretrained/{opt.fold}_teacher.pth'
 
@@ -147,7 +147,7 @@ def save_model(epoch, student, train_save, student_modality=None):
     torch.save(student.state_dict(), stu_path)
     # also save to ./pretrained with modality suffix if provided
     if student_modality is not None:
-        pretrained_path = f'./pretrained/{opt.dataset}_{opt.fold}_student_{student_modality}.pth'
+        pretrained_path = f'./pretrained/{opt.dataset}_student_{student_modality}_{opt.fold}.pth'
         torch.save(student.state_dict(), pretrained_path)
 
 
