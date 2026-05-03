@@ -16,10 +16,10 @@ CFG = {
     "no_match_score_thresh": 0.06, "resize": 256,
     # 默认类别阈值：'正常' 更严格，其余保持 0.6
     "class_thresh": {
-        "正常": 0.1,
-        "鳞状细胞癌": 0.6,
-        "低瘤": 0.6,
-        "高瘤": 0.6
+        "正常": 0.12,
+        "鳞状细胞癌": 0.06,
+        "低瘤": 0.06,
+        "高瘤": 0.06
     },
     "percentile_p_nbi": 10, "percentile_p_wli": 10,
     "dark_range_min_ratio": 0.04,  # 灰度范围边界最小像素占比
@@ -498,7 +498,7 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None, lab
     debug["total_possible_pairs"] = total_possible
     
     # 额外输出：在原始患者目录下写入配对 CSV（如果提供了 patient_dir）
-    if patient_dir is not None and rows:
+    if patient_dir is not None:
         try:
             out_csv = os.path.join(patient_dir, "paired_matches.csv")
             with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
