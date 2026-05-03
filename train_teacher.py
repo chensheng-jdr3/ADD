@@ -70,7 +70,7 @@ def train(teacher, class_names, epochs=400, is_test=True, loader=None, val_loade
     val_acc_best = 0
     val_macro_f1_best = 0
     best_model_epoch = 0
-    best_model_path = './pretrained/{}_teacher_{}_{}.pth'.format(opt.dataset, modality, i)
+    best_model_path = './pretrained/{}_{}_teacher_{}.pth'.format(opt.dataset, i, modality)
     # 混淆矩阵不再另外保存为文件，改为写入日志
     num_classes = len(class_names)
     if is_test:
