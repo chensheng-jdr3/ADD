@@ -13,7 +13,14 @@ from preproc_dark import compute_hard_mask, compute_dark_region
 # 默认配置
 CFG = {
     "nmi_bins": 64, "ambiguity_thresh": 0.1,
-    "no_match_score_thresh": 0.6, "resize": 256,
+    "no_match_score_thresh": 0.06, "resize": 256,
+    # 默认类别阈值：'正常' 更严格，其余保持 0.6
+    "class_thresh": {
+        "正常": 0.1,
+        "鳞状细胞癌": 0.6,
+        "低瘤": 0.6,
+        "高瘤": 0.6
+    },
     "percentile_p_nbi": 10, "percentile_p_wli": 10,
     "dark_range_min_ratio": 0.04,  # 灰度范围边界最小像素占比
     "dark_range_start_gray": 5,   # 从该灰度开始寻找范围边界
@@ -303,58 +310,35 @@ def greedy_assignment(scores, thresh):
     return assign
 
 
-def draw_triplet(nbi, wli1, wli2, nw, ww1, ww2, s1, s2, path):
-    """保存可视化：第一行原图，第二行权重热力图"""
+def draw_triplet(nbi, wli, nw, ww, s, path):
+    """保存可视化：只保存配对的原图与对应权重热力图"""
     h = 256
     to_panel = lambda img: cv2.resize(img, (h, h)) if img is not None else np.zeros((h, h, 3), dtype=np.uint8)
-    
-    # 单一定义 weight_to_heatmap 在下面，移除上方重复占位定义
 
     def weight_to_heatmap(w, orig=None, alpha=0.6):
-        """将权重图转换为与原图叠加的热力图（orig 位于下层）
-
-        参数：
-            w: 权重图，float (0-1) 或 uint8 (0-255)
-            orig: 对应的原图，用作下层（若 None 则使用黑底）
-            alpha: 热力图的透明度（0-1），越大热力图越显眼
-        返回：BGR 三通道图像，尺寸 (h,h,3)
-        """
         orig_img = to_panel(orig) if orig is not None else np.zeros((h, h, 3), dtype=np.uint8)
-
         if w is None:
             return orig_img
-
-        # 调整权重到 uint8 0-255
         w_resized = cv2.resize(w, (h, h)) if w.shape[:2] != (h, h) else w
         w_f = w_resized.astype(np.float32)
         if w_f.max() <= 1.1:
             w_u8 = (np.clip(w_f, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
             w_u8 = np.clip(w_f, 0, 255).astype(np.uint8)
-
         color_map = cv2.applyColorMap(w_u8, cv2.COLORMAP_JET)
-
-        # 整体混合：无论权重是否为0，都将 colormap 与原图按 alpha 混合，
-        # 这样 0 对应 colormap(0)（通常为最暗色），不会出现“透明”区域。
         blended = cv2.addWeighted(color_map, alpha, orig_img, 1.0 - alpha, 0)
         return blended
-    
-    row1 = np.concatenate([to_panel(nbi), to_panel(wli1), to_panel(wli2)], axis=1)
-    row2 = np.concatenate([
-        weight_to_heatmap(nw, nbi),
-        weight_to_heatmap(ww1, wli1),
-        weight_to_heatmap(ww2, wli2)
-    ], axis=1)
+
+    row1 = np.concatenate([to_panel(nbi), to_panel(wli)], axis=1)
+    row2 = np.concatenate([weight_to_heatmap(nw, nbi), weight_to_heatmap(ww, wli)], axis=1)
     canvas = np.concatenate([row1, row2], axis=0)
-    
-    cv2.putText(canvas, f"best={s1:.3f}", (h + 10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(canvas, f"2nd ={s2:.3f}", (2*h + 10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    
+    cv2.putText(canvas, f"score={s:.3f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".jpg", canvas)
-    if ok: buf.tofile(path)
+    if ok:
+        buf.tofile(path)
 
 
-def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
+def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None, label=None):
     """对单个患者做匹配"""
     # 预处理（返回：显示图, 梯度图, 权重图）
     load = lambda paths, key: [(path, *preprocess(
@@ -372,9 +356,9 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     
     N, M = len(nbi_data), len(wli_data)
     if N == 0:
-        return [], {"patient_id": pid, "note": "no NBI"}
+        return [], {"patient_id": pid, "note": "no NBI"}, 0, 0
     if M == 0:
-        return [[pid, os.path.basename(d[0]), "", 0.0, 1] for d in nbi_data], {"patient_id": pid, "note": "no WLI"}
+        return [], {"patient_id": pid, "note": "no WLI"}, N, 0
     
     # 为每张图预计算灰度、硬掩码、暗区、以及关键点/描述子（用于可选的 SIFT+RANSAC 过滤）
     # 这样在计算权重时可以将另一幅图的描述子传入以进行 RANSAC 内点筛选。
@@ -432,16 +416,15 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
     nbi_items = [prepare_item((p, d, g, w)) for p, d, g, w in nbi_data]
     wli_items = [prepare_item((p, d, g, w)) for p, d, g, w in wli_data]
 
-    # 按行在线计算相似度：对每张 NBI，逐一计算与所有 WLI 的相似度，取最高和次高
+    # 恢复完整相似度矩阵：计算 N x M 的相似度，并将所有超过阈值的配对纳入结果
     vis_dir = os.path.join(out_dir, "vis", pid)
     os.makedirs(vis_dir, exist_ok=True)
     rows, debug = [], {"patient_id": pid, "items": []}
 
-    for i in range(N):
-        # 对第 i 张 NBI，遍历所有 WLI 计算相似度并记录 top1/top2
-        best_s, second_s = -1.0, -1.0
-        best_j, second_j = -1, -1
+    sim_mat = np.zeros((N, M), dtype=np.float32)
 
+    # 计算完整相似度矩阵
+    for i in range(N):
         for j in range(M):
             g1 = nbi_items[i]["grad"]
             g2 = wli_items[j]["grad"]
@@ -457,41 +440,62 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
                 w2 = wli_items[j]["weight"]
 
             s = compute_weighted_nmi(g1, g2, w1, w2, bins=cfg["nmi_bins"])
+            sim_mat[i, j] = s
 
-            if s > best_s:
-                second_s, second_j = best_s, best_j
-                best_s, best_j = s, j
-            elif s > second_s:
-                second_s, second_j = s, j
+    # 计算每行的 top1（用于可视化参考），但不再考虑第二分数或模糊判定
+    row_best = np.max(sim_mat, axis=1)
+    # 支持基于类别的阈值映射：cfg["class_thresh"] = {"label": thresh}
+    if label and isinstance(cfg.get("class_thresh"), dict) and label in cfg.get("class_thresh"):
+        thresh = cfg["class_thresh"][label]
+    else:
+        thresh = cfg.get("no_match_score_thresh", 0.6)
 
-        # 计算不确定性指标
-        s1 = best_s if best_s >= 0 else 0.0
-        s2 = second_s if second_s >= 0 else 0.0
-        is_amb = 1 if s1 <= 1e-12 or (M >= 2 and (s1 - s2) / (s1 + 1e-12) < cfg["ambiguity_thresh"]) else 0
+    # 选择所有超过阈值的配对（先收集，再做可能的裁剪）；延迟可视化，裁剪后仅为保留项生成图像
+    candidates = []
+    inds = np.argwhere(sim_mat >= thresh)
+    for (i, j) in inds:
+        s = float(sim_mat[i, j])
+        nbi_path, nbi_disp, _, nbi_weight = nbi_data[i]
+        wli_path, wli_disp, _, wli_weight = wli_data[j]
+        base = os.path.basename(nbi_path)
+        wli_name = os.path.basename(wli_path)
+        candidates.append({
+            "i": i, "j": j, "nbi_path": nbi_path, "wli_path": wli_path,
+            "nbi_disp": nbi_disp, "wli_disp": wli_disp,
+            "nbi_weight": nbi_weight, "wli_weight": wli_weight,
+            "base": base, "wli_name": wli_name, "s": s
+        })
 
-        # 若最高分达到阈值，则视为匹配
-        if best_j >= 0 and s1 >= cfg.get("no_match_score_thresh", 0.6):
-            nbi_path, nbi_disp, _, nbi_weight = nbi_data[i]
-            base = os.path.basename(nbi_path)
-            wli_name = os.path.basename(wli_data[best_j][0])
-            rows.append([pid, base, wli_name, float(s1), is_amb])
+    # 如果配对过多（超过总可能配对数的25%），按得分排序只保留前25%
+    total_possible = int(N * M)
+    original_matched = len(candidates)
+    max_allowed = int(math.floor(0.25 * total_possible)) if total_possible > 0 else 0
+    if max_allowed > 0 and original_matched > max_allowed:
+        candidates_sorted = sorted(candidates, key=lambda x: x["s"], reverse=True)
+        kept = candidates_sorted[:max_allowed]
+        pruned = True
+    else:
+        kept = candidates
+        pruned = False
 
-            # 可视化：使用 top1/top2 的显示图与权重
-            j1, j2 = best_j, second_j if second_j >= 0 else best_j
-            draw_triplet(nbi_data[i][1], wli_data[j1][1] if j1 >= 0 else None, wli_data[j2][1] if j2 >= 0 else None,
-                         nbi_data[i][3], wli_data[j1][3] if j1 >= 0 else None, wli_data[j2][3] if j2 >= 0 else None,
-                         s1, s2, os.path.join(vis_dir, f"{os.path.splitext(base)[0]}_match.jpg"))
+    # 为被保留的配对生成 rows/debug 与可视化
+    rows = []
+    debug = {"patient_id": pid, "items": []}
+    for c in kept:
+        rows.append([pid, c["base"], c["wli_name"], c["s"]])
+        # 可视化：只为保留的配对保存图像
+        draw_triplet(c["nbi_disp"], c["wli_disp"], c["nbi_weight"], c["wli_weight"], c["s"],
+                     os.path.join(vis_dir, f"{os.path.splitext(c['base'])[0]}_match_{c['j']}.jpg"))
+        debug["items"].append({
+            "nbi": c["base"],
+            "assigned_wli": c["wli_name"],
+            "assigned_score": c["s"]
+        })
 
-            debug["items"].append({
-                "nbi": base,
-                "assigned_wli": wli_name,
-                "assigned_score": float(s1),
-                "top1_wli": os.path.basename(wli_data[j1][0]) if j1 >= 0 else "",
-                "top1_score": float(s1),
-                "top2_wli": os.path.basename(wli_data[j2][0]) if j2 >= 0 else "",
-                "top2_score": float(s2),
-                "is_ambiguous": is_amb
-            })
+    debug["pruned"] = pruned
+    debug["original_matched"] = original_matched
+    debug["kept_pairs"] = len(kept)
+    debug["total_possible_pairs"] = total_possible
     
     # 额外输出：在原始患者目录下写入配对 CSV（如果提供了 patient_dir）
     if patient_dir is not None and rows:
@@ -499,14 +503,14 @@ def match_patient(pid, nbi_paths, wli_paths, cfg, out_dir, patient_dir=None):
             out_csv = os.path.join(patient_dir, "paired_matches.csv")
             with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["nbi_filename", "wli_filename", "score", "is_ambiguous"])
+                w.writerow(["nbi_filename", "wli_filename", "score"])
                 for r in rows:
-                    # r 格式: [patient_id, nbi_filename, wli_filename, final_score, is_ambiguous]
-                    w.writerow([r[1], r[2], r[3], r[4]])
+                    # r 格式: [patient_id, nbi_filename, wli_filename, final_score]
+                    w.writerow([r[1], r[2], r[3]])
         except Exception:
             pass
 
-    return rows, debug
+    return rows, debug, N, M
 
 
 def main():
@@ -525,6 +529,9 @@ def main():
     ts_root = os.path.join(cfg["out_dir"], f"{datetime.now():%Y%m%d%H%M}")
     os.makedirs(ts_root, exist_ok=True)
     print("输出目录:", ts_root)
+
+    # 运行统计收集
+    stats = {}
 
     # 固定任务与标签集合（根据用户确认）
     TASKS = ["train", "val", "test"]
@@ -546,28 +553,53 @@ def main():
                 print(f"[{task}/{label}] 未发现患者目录")
                 continue
 
+            # 初始化统计
+            stats.setdefault(task, {})
+            stats[task].setdefault(label, {"total_patients": 0, "no_pairs": 0, "pruned_count": 0})
+
             for pid in patients:
                 pdir = os.path.join(label_dir, pid)
                 nbi_dir = os.path.join(pdir, "NBI")
                 wli_dir = os.path.join(pdir, "WLI")
                 if not (os.path.isdir(nbi_dir) and os.path.isdir(wli_dir)):
                     continue
-
-                rows, dbg = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), cfg, out_dir, pdir)
+                stats[task][label]["total_patients"] += 1
+                rows, dbg, nbi_count, wli_count = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), cfg, out_dir, pdir, label=label)
                 all_rows.extend(rows)
                 if dbg.get("items"):
                     all_debug.append(dbg)
-                print(f"[{task}/{label}/{pid}] matched={len(rows)}")
+                prod = nbi_count * wli_count
+                if dbg.get("pruned"):
+                    kept = dbg.get("kept_pairs", len(rows))
+                    orig = dbg.get("original_matched", "?")
+                    stats[task][label]["pruned_count"] += 1
+                    print(f"[{task}/{label}/{pid}] matched={len(rows)}/{prod} (NBI={nbi_count}, WLI={wli_count}) PRUNED {kept}/{orig} kept")
+                else:
+                    if len(rows) == 0:
+                        stats[task][label]["no_pairs"] += 1
+                    print(f"[{task}/{label}/{pid}] matched={len(rows)}/{prod} (NBI={nbi_count}, WLI={wli_count})")
 
             # 保存该 task/label 的结果（仅成功配对记录）
             if all_rows:
                 with open(os.path.join(out_dir, "results.csv"), "w", newline="", encoding="utf-8-sig") as f:
                     w = csv.writer(f)
-                    w.writerow(["patient_id", "nbi_filename", "wli_filename", "final_score", "is_ambiguous"])
+                    w.writerow(["patient_id", "nbi_filename", "wli_filename", "final_score"])
                     w.writerows(all_rows)
 
             with open(os.path.join(out_dir, "debug.json"), "w", encoding="utf-8") as f:
                 json.dump(all_debug, f, ensure_ascii=False, indent=2)
+
+    # 保存运行日志与统计到 ts_root/run_log.json
+    run_log = {
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        "cfg": cfg,
+        "stats": stats,
+    }
+    try:
+        with open(os.path.join(ts_root, "run_log.json"), "w", encoding="utf-8") as f:
+            json.dump(run_log, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
     print("完成！")
 

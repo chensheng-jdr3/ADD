@@ -21,15 +21,27 @@ def run_flat(dataset_root, out_root):
 
     # 固定裁剪框：top, bottom, left, right
     CFG["crop_box"] = (40, 1040, 700, 1855)
-    CFG["no_match_score_thresh"] = 0
+    CFG["no_match_score_thresh"] = 0.08
+    # 本脚本默认的类别阈值（按轻度、中度、重度、癌 递减）：
+    CFG["class_thresh"] = {
+        "轻度": 0.06,
+        "中度": 0.06,
+        "重度": 0.06,
+        "癌": 0.06,
+    }
 
     all_rows = []
     all_debug = []
+    stats = {}
 
     # 假定 dataset_root 的第一层为 label，遍历每个 label 下的患者目录
     for label in entries:
         label_path = os.path.join(dataset_root, label)
         patients = [d for d in sorted(os.listdir(label_path)) if os.path.isdir(os.path.join(label_path, d))]
+
+        # 初始化统计
+        stats.setdefault(label, {"total_patients": 0, "no_pairs": 0, "pruned_count": 0})
+
         for sub in patients:
             pdir = os.path.join(label_path, sub)
             nbi_dir = os.path.join(pdir, "NBI")
@@ -39,22 +51,44 @@ def run_flat(dataset_root, out_root):
                 continue
 
             pid = f"{label}/{sub}"
-            rows, dbg = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), CFG, ts_dir, pdir)
+            stats[label]["total_patients"] += 1
+            rows, dbg, nbi_count, wli_count = match_patient(pid, list_images(nbi_dir), list_images(wli_dir), CFG, ts_dir, pdir, label=label)
             all_rows.extend(rows)
             if dbg.get("items"):
                 all_debug.append(dbg)
-            print(f"{pid}: matched={len(rows)}")
+            prod = nbi_count * wli_count
+            if dbg.get("pruned"):
+                stats[label]["pruned_count"] += 1
+                kept = dbg.get("kept_pairs", len(rows))
+                orig = dbg.get("original_matched", "?")
+                print(f"{pid}: matched={len(rows)}/{prod} (NBI={nbi_count}, WLI={wli_count}) PRUNED {kept}/{orig} kept")
+            else:
+                if len(rows) == 0:
+                    stats[label]["no_pairs"] += 1
+                print(f"{pid}: matched={len(rows)}/{prod} (NBI={nbi_count}, WLI={wli_count})")
 
     # 保存结果
     if all_rows:
         out_csv = os.path.join(ts_dir, "results.csv")
         with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["patient_id", "nbi_filename", "wli_filename", "final_score", "is_ambiguous"])
+            w.writerow(["patient_id", "nbi_filename", "wli_filename", "final_score"])
             w.writerows(all_rows)
 
     with open(os.path.join(ts_dir, "debug.json"), "w", encoding="utf-8") as f:
         json.dump(all_debug, f, ensure_ascii=False, indent=2)
+
+    # 保存运行日志和统计
+    run_log = {
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        "cfg": CFG,
+        "stats": stats,
+    }
+    try:
+        with open(os.path.join(ts_dir, "run_log.json"), "w", encoding="utf-8") as f:
+            json.dump(run_log, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
     print("输出目录:", ts_dir)
 
